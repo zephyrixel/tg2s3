@@ -1,0 +1,7 @@
+.git
+.env
+data
+target
+Dockerfile*
+docker-compose*
+*.sqlite3

@@ -11,6 +11,33 @@ pub struct ObjectMetadata {
     pub user: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CorsConfiguration {
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub max_age_seconds: u64,
+}
+
+impl Default for CorsConfiguration {
+    fn default() -> Self {
+        Self {
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec![
+                "GET".to_string(),
+                "POST".to_string(),
+                "PUT".to_string(),
+                "DELETE".to_string(),
+                "HEAD".to_string(),
+            ],
+            allowed_headers: vec!["*".to_string()],
+            expose_headers: vec!["ETag".to_string()],
+            max_age_seconds: 3600,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BlockRef {
     pub id: i64,

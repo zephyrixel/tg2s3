@@ -1,0 +1,17 @@
+services:
+  tg2s3:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TG2S3_DATA_DIR: /app/data
+      TG2S3_DB_PATH: /app/data/tg2s3.sqlite3
+      TG2S3_LISTEN: 0.0.0.0:9000
+    ports:
+      - "9000:9000"
+    volumes:
+      - tg2s3-data:/app/data
+
+volumes:
+  tg2s3-data:

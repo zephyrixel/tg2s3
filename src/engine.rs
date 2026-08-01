@@ -53,16 +53,18 @@ impl Engine {
         metadata: ObjectMetadata,
         expected_length: Option<i64>,
     ) -> Result<ObjectRecord> {
-        self.require_bucket(bucket)?;
+        self.require_bucket(bucket).await?;
         let upload_id = format!("put-{}", Uuid::new_v4());
-        self.db.create_upload(&UploadRecord {
-            upload_id: upload_id.clone(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            metadata,
-            kind: "put".to_string(),
-            created_at: now(),
-        })?;
+        self.db
+            .create_upload(&UploadRecord {
+                upload_id: upload_id.clone(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                metadata,
+                kind: "put".to_string(),
+                created_at: now(),
+            })
+            .await?;
         let result = async {
             let (part, actual_length) = self.upload_stream(&upload_id, 0, body).await?;
             if let Some(expected) = expected_length
@@ -73,17 +75,19 @@ impl Engine {
                 );
             }
             self.db
-                .replace_part(&upload_id, 0, actual_length, &part.etag, &part.blocks)?;
+                .replace_part(&upload_id, 0, actual_length, &part.etag, &part.blocks)
+                .await?;
             let etag = part.etag.clone();
             let committed = self
                 .db
-                .commit_upload(&upload_id, actual_length, &etag, &[part])?
+                .commit_upload(&upload_id, actual_length, &etag, &[part])
+                .await?
                 .ok_or_else(|| anyhow!("upload disappeared"))?;
             Ok(committed.0)
         }
         .await;
         if result.is_err() {
-            let _ = self.db.abort_upload(&upload_id);
+            let _ = self.db.abort_upload(&upload_id).await;
         }
         result
     }
@@ -94,16 +98,18 @@ impl Engine {
         key: &str,
         metadata: ObjectMetadata,
     ) -> Result<String> {
-        self.require_bucket(bucket)?;
+        self.require_bucket(bucket).await?;
         let upload_id = Uuid::new_v4().to_string();
-        self.db.create_upload(&UploadRecord {
-            upload_id: upload_id.clone(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            metadata,
-            kind: "multipart".to_string(),
-            created_at: now(),
-        })?;
+        self.db
+            .create_upload(&UploadRecord {
+                upload_id: upload_id.clone(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                metadata,
+                kind: "multipart".to_string(),
+                created_at: now(),
+            })
+            .await?;
         Ok(upload_id)
     }
 
@@ -118,14 +124,16 @@ impl Engine {
         }
         let upload = self
             .db
-            .get_upload(upload_id)?
+            .get_upload(upload_id)
+            .await?
             .ok_or_else(|| anyhow!("NoSuchUpload"))?;
         if upload.kind != "multipart" {
             bail!("NoSuchUpload");
         }
         let (part, size) = self.upload_stream(upload_id, part_number, body).await?;
         self.db
-            .replace_part(upload_id, part_number, size, &part.etag, &part.blocks)?;
+            .replace_part(upload_id, part_number, size, &part.etag, &part.blocks)
+            .await?;
         Ok(PartRecord {
             upload_id: upload_id.to_string(),
             part_number,
@@ -142,7 +150,8 @@ impl Engine {
     ) -> Result<ObjectRecord> {
         let upload = self
             .db
-            .get_upload(upload_id)?
+            .get_upload(upload_id)
+            .await?
             .ok_or_else(|| anyhow!("NoSuchUpload"))?;
         if upload.kind != "multipart" {
             bail!("NoSuchUpload");
@@ -155,7 +164,7 @@ impl Engine {
                 bail!("InvalidPartOrder");
             }
         }
-        let stored = self.db.get_parts(upload_id, false)?;
+        let stored = self.db.get_parts(upload_id, false).await?;
         if stored.len() != requested.len() {
             bail!("InvalidPart");
         }
@@ -184,38 +193,40 @@ impl Engine {
         let etag = format!("{:x}-{}", composite.finalize(), requested.len());
         let (object, _) = self
             .db
-            .commit_upload(upload_id, total_size, &etag, &ordered)?
+            .commit_upload(upload_id, total_size, &etag, &ordered)
+            .await?
             .ok_or_else(|| anyhow!("NoSuchUpload"))?;
         Ok(object)
     }
 
-    pub fn list_parts(&self, upload_id: &str) -> Result<Vec<PartRecord>> {
-        if self.db.get_upload(upload_id)?.is_none() {
+    pub async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartRecord>> {
+        if self.db.get_upload(upload_id).await?.is_none() {
             bail!("NoSuchUpload");
         }
-        self.db.get_parts(upload_id, false)
+        self.db.get_parts(upload_id, false).await
     }
 
-    pub fn list_uploads(&self, bucket: &str, key: Option<&str>) -> Result<Vec<UploadRecord>> {
-        self.require_bucket(bucket)?;
-        self.db.list_uploads(bucket, key)
+    pub async fn list_uploads(&self, bucket: &str, key: Option<&str>) -> Result<Vec<UploadRecord>> {
+        self.require_bucket(bucket).await?;
+        self.db.list_uploads(bucket, key).await
     }
 
-    pub fn abort_multipart(&self, upload_id: &str) -> Result<bool> {
-        self.db.abort_upload(upload_id)
+    pub async fn abort_multipart(&self, upload_id: &str) -> Result<bool> {
+        self.db.abort_upload(upload_id).await
     }
 
-    pub fn get_object(&self, bucket: &str, key: &str) -> Result<ObjectRecord> {
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<ObjectRecord> {
         self.db
-            .get_object(bucket, key)?
+            .get_object(bucket, key)
+            .await?
             .ok_or_else(|| anyhow!("NoSuchKey"))
     }
 
-    pub fn delete_object(&self, bucket: &str, key: &str) -> Result<bool> {
-        Ok(self.db.delete_object(bucket, key)?.is_some())
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool> {
+        Ok(self.db.delete_object(bucket, key).await?.is_some())
     }
 
-    pub fn copy_object(
+    pub async fn copy_object(
         &self,
         source_bucket: &str,
         source_key: &str,
@@ -223,9 +234,9 @@ impl Engine {
         key: &str,
         metadata: &ObjectMetadata,
     ) -> Result<ObjectRecord> {
-        self.require_bucket(bucket)?;
-        let source = self.get_object(source_bucket, source_key)?;
-        Ok(self.db.copy_object(&source, bucket, key, metadata)?.0)
+        self.require_bucket(bucket).await?;
+        let source = self.get_object(source_bucket, source_key).await?;
+        Ok(self.db.copy_object(&source, bucket, key, metadata).await?.0)
     }
 
     pub fn range_stream(
@@ -268,23 +279,25 @@ impl Engine {
 
     pub async fn run_gc(&self, limit: usize) -> Result<usize> {
         let timestamp = now();
-        let _ = self.db.expire_uploads(timestamp - 7 * 24 * 3600)?;
-        for stale in self.db.stale_blocks(timestamp - 3600)? {
-            self.db.delete_stale_block(stale.block_id)?;
+        let _ = self.db.expire_uploads(timestamp - 7 * 24 * 3600).await?;
+        for stale in self.db.stale_blocks(timestamp - 3600).await? {
+            self.db.delete_stale_block(stale.block_id).await?;
         }
-        let candidates = self.db.gc_candidates(timestamp, limit)?;
+        let candidates = self.db.gc_candidates(timestamp, limit).await?;
         let mut processed = 0;
         for candidate in candidates {
             if candidate.message_date > 0 && candidate.message_date < timestamp - 48 * 3600 {
                 self.db
-                    .gc_orphan(candidate.block_id, "Telegram deleteMessage 48 hour limit")?;
+                    .gc_orphan(candidate.block_id, "Telegram deleteMessage 48 hour limit")
+                    .await?;
                 continue;
             }
             match self.telegram.delete_message(candidate.message_id).await {
-                Ok(()) => self.db.gc_success(candidate.block_id)?,
+                Ok(()) => self.db.gc_success(candidate.block_id).await?,
                 Err(error) => {
                     self.db
-                        .gc_failure(candidate.block_id, &error.to_string(), timestamp + 300)?
+                        .gc_failure(candidate.block_id, &error.to_string(), timestamp + 300)
+                        .await?
                 }
             }
             processed += 1;
@@ -398,7 +411,7 @@ impl Engine {
                 file_unique_id: block.file_unique_id,
                 message_date: block.message_date,
             };
-            let id = self.db.add_staged_block(&reference)?;
+            let id = self.db.add_staged_block(&reference).await?;
             refs.push(BlockRef { id, ..reference });
         }
         let etag = format!("{:x}", digest.finalize());
@@ -451,8 +464,8 @@ impl Engine {
         })
     }
 
-    fn require_bucket(&self, bucket: &str) -> Result<()> {
-        if !self.db.bucket_exists(bucket)? {
+    async fn require_bucket(&self, bucket: &str) -> Result<()> {
+        if !self.db.bucket_exists(bucket).await? {
             bail!("NoSuchBucket");
         }
         Ok(())
@@ -483,6 +496,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::db::Db;
+    use anyhow::Context;
     use axum::extract::State;
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
@@ -627,13 +641,18 @@ mod tests {
         let app = axum::Router::new()
             .fallback(mock_telegram)
             .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address: SocketAddr = listener.local_addr()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind Telegram mock listener")?;
+        let address: SocketAddr = listener
+            .local_addr()
+            .context("read Telegram mock listener address")?;
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         let directory = tempdir()?;
         let config = Config {
+            data_dir: directory.path().to_path_buf(),
             db_path: directory.path().join("db.sqlite3"),
             listen: "127.0.0.1:0".parse().unwrap(),
             bot_token: "token".to_string(),
@@ -648,9 +667,13 @@ mod tests {
             allow_anonymous: true,
             region: "us-east-1".to_string(),
             public_host: None,
+            init_buckets: Vec::new(),
+            cors: crate::model::CorsConfiguration::default(),
+            gc_interval: 300,
+            gc_limit: 100,
         };
-        let db = Db::open(&config.db_path)?;
-        db.create_bucket("bucket")?;
+        let db = Db::open(&config.db_path).await?;
+        db.create_bucket("bucket").await?;
         let telegram = TelegramClient::new(&config)?;
         let engine = Engine::new(config, db, telegram);
         let data = b"hello telegram storage";
@@ -680,14 +703,42 @@ mod tests {
                 allow_anonymous: true,
             },
             public_host: None,
+            cors: crate::model::CorsConfiguration::default(),
         });
-        let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let s3_address = s3_listener.local_addr()?;
+        let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind S3 test listener")?;
+        let s3_address = s3_listener
+            .local_addr()
+            .context("read S3 test listener address")?;
         tokio::spawn(async move {
             axum::serve(s3_listener, s3_app).await.unwrap();
         });
         let client = reqwest::Client::new();
         let endpoint = format!("http://{s3_address}/bucket/http-key");
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, &endpoint)
+            .header("origin", "https://cloudreve.example")
+            .header("access-control-request-method", "PUT")
+            .header("access-control-request-headers", "content-type")
+            .send()
+            .await?;
+        assert_eq!(preflight.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert!(
+            preflight
+                .headers()
+                .get("access-control-allow-methods")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .contains("PUT")
+        );
         let response = client.put(&endpoint).body("abcdef").send().await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let response = client
@@ -703,6 +754,34 @@ mod tests {
             .send()
             .await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let cors_xml = r#"
+            <CORSConfiguration>
+              <CORSRule>
+                <AllowedOrigin>https://cloudreve.example</AllowedOrigin>
+                <AllowedMethod>GET</AllowedMethod>
+                <AllowedHeader>*</AllowedHeader>
+                <ExposeHeader>ETag</ExposeHeader>
+                <MaxAgeSeconds>600</MaxAgeSeconds>
+              </CORSRule>
+            </CORSConfiguration>
+        "#;
+        let response = client
+            .put(format!("http://{s3_address}/bucket?cors"))
+            .body(cors_xml)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let response = client
+            .get(format!("http://{s3_address}/bucket?cors"))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.text().await?.contains("cloudreve.example"));
+        let response = client
+            .delete(format!("http://{s3_address}/bucket?cors"))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         let listing = client
             .get(format!("http://{s3_address}/bucket?list-type=2"))
             .send()

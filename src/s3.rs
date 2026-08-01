@@ -1,11 +1,12 @@
 use crate::auth::SigV4;
 use crate::engine::Engine;
-use crate::model::{ObjectMetadata, ObjectRecord};
+use crate::model::{CorsConfiguration, ObjectMetadata, ObjectRecord};
 use anyhow::{Result, anyhow, bail};
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::response::Response;
+use axum::routing::get;
 use base64::Engine as _;
 use quick_xml::{de::from_str, se::to_string};
 use serde::{Deserialize, Serialize};
@@ -22,28 +23,58 @@ pub struct AppState {
     pub engine: Engine,
     pub auth: SigV4,
     pub public_host: Option<String>,
+    pub cors: CorsConfiguration,
 }
 
 pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .fallback(handle)
         .with_state(Arc::new(state))
+}
+
+async fn healthz() -> Response {
+    empty_response(StatusCode::OK)
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> Response {
+    match state.engine.db.integrity_check().await {
+        Ok(result) if result == "ok" => empty_response(StatusCode::OK),
+        Ok(result) => Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(format!("SQLite integrity check: {result}")))
+            .unwrap_or_else(|_| empty_response(StatusCode::SERVICE_UNAVAILABLE)),
+        Err(error) => Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(format!("database unavailable: {error}")))
+            .unwrap_or_else(|_| empty_response(StatusCode::SERVICE_UNAVAILABLE)),
+    }
 }
 
 async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let (parts, body) = request.into_parts();
     let request_id = Uuid::new_v4().simple().to_string();
     let request_uri = parts.uri.clone();
-    if let Err(error) = state.auth.verify(&parts.method, &parts.uri, &parts.headers) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            error_code(&error),
-            &error.to_string(),
-            &parts.uri,
-            &request_id,
-        );
+    let request_headers = parts.headers.clone();
+    if parts.method != Method::OPTIONS
+        && let Err(error) = state.auth.verify(&parts.method, &parts.uri, &parts.headers)
+    {
+        return apply_cors(
+            &state,
+            &request_uri,
+            &request_headers,
+            error_response(
+                StatusCode::FORBIDDEN,
+                error_code(&error),
+                &error.to_string(),
+                &parts.uri,
+                &request_id,
+            ),
+        )
+        .await;
     }
-    match dispatch(
+    let response = match dispatch(
         &state,
         parts.method,
         parts.uri,
@@ -61,7 +92,8 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
             &request_uri,
             &request_id,
         ),
-    }
+    };
+    apply_cors(&state, &request_uri, &request_headers, response).await
 }
 
 async fn dispatch(
@@ -77,9 +109,12 @@ async fn dispatch(
         form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
             .into_owned()
             .collect();
+    if method == Method::OPTIONS {
+        return Ok(empty_response(StatusCode::NO_CONTENT));
+    }
     if target.bucket.is_none() {
         return match method {
-            Method::GET => list_buckets(&state.engine),
+            Method::GET => list_buckets(&state.engine).await,
             _ => Err(anyhow!("MethodNotAllowed")),
         };
     }
@@ -102,9 +137,17 @@ async fn dispatch_bucket(
     body: Body,
     _request_id: &str,
 ) -> Result<Response> {
+    if query_has(query, "cors") {
+        return match method {
+            Method::GET => get_bucket_cors(state, bucket).await,
+            Method::PUT => put_bucket_cors(state, bucket, body).await,
+            Method::DELETE => delete_bucket_cors(state, bucket).await,
+            _ => Err(anyhow!("MethodNotAllowed")),
+        };
+    }
     if query_has(query, "uploads") {
         return match method {
-            Method::GET => list_multipart_uploads(&state.engine, bucket),
+            Method::GET => list_multipart_uploads(&state.engine, bucket).await,
             _ => Err(anyhow!("MethodNotAllowed")),
         };
     }
@@ -130,7 +173,7 @@ async fn dispatch_bucket(
         || query_has(query, "max-keys")
     {
         return if method == Method::GET {
-            list_objects(&state.engine, bucket, query)
+            list_objects(&state.engine, bucket, query).await
         } else {
             Err(anyhow!("MethodNotAllowed"))
         };
@@ -138,7 +181,7 @@ async fn dispatch_bucket(
     match method {
         Method::PUT => {
             validate_bucket(bucket)?;
-            state.engine.db.create_bucket(bucket)?;
+            state.engine.db.create_bucket(bucket).await?;
             let mut response = empty_response(StatusCode::OK);
             response.headers_mut().insert(
                 header::LOCATION,
@@ -147,18 +190,18 @@ async fn dispatch_bucket(
             Ok(response)
         }
         Method::HEAD => {
-            if state.engine.db.bucket_exists(bucket)? {
+            if state.engine.db.bucket_exists(bucket).await? {
                 Ok(empty_response(StatusCode::OK))
             } else {
                 Err(anyhow!("NoSuchBucket"))
             }
         }
-        Method::DELETE => match state.engine.db.delete_bucket(bucket)? {
+        Method::DELETE => match state.engine.db.delete_bucket(bucket).await? {
             None => Err(anyhow!("NoSuchBucket")),
             Some(false) => Err(anyhow!("BucketNotEmpty")),
             Some(true) => Ok(empty_response(StatusCode::NO_CONTENT)),
         },
-        Method::GET => list_objects(&state.engine, bucket, query),
+        Method::GET => list_objects(&state.engine, bucket, query).await,
         _ => Err(anyhow!("MethodNotAllowed")),
     }
 }
@@ -174,20 +217,21 @@ async fn dispatch_object(
     body: Body,
     _request_id: &str,
 ) -> Result<Response> {
-    if !state.engine.db.bucket_exists(bucket)? {
+    if !state.engine.db.bucket_exists(bucket).await? {
         bail!("NoSuchBucket");
     }
     if let Some(upload_id) = query_value(query, "uploadId") {
         let upload = state
             .engine
             .db
-            .get_upload(&upload_id)?
+            .get_upload(&upload_id)
+            .await?
             .ok_or_else(|| anyhow!("NoSuchUpload"))?;
         if upload.bucket != bucket || upload.key != key {
             bail!("NoSuchUpload");
         }
         return match method {
-            Method::GET => list_parts(&state.engine, upload_id),
+            Method::GET => list_parts(&state.engine, upload_id).await,
             Method::PUT => {
                 let part_number = query_value(query, "partNumber")
                     .ok_or_else(|| anyhow!("InvalidArgument"))?
@@ -205,7 +249,7 @@ async fn dispatch_object(
             }
             Method::POST => complete_multipart(&state.engine, &upload_id, body).await,
             Method::DELETE => {
-                if !state.engine.abort_multipart(&upload_id)? {
+                if !state.engine.abort_multipart(&upload_id).await? {
                     bail!("NoSuchUpload");
                 }
                 Ok(empty_response(StatusCode::NO_CONTENT))
@@ -218,10 +262,10 @@ async fn dispatch_object(
             .get("x-amz-copy-source")
             .and_then(|value| value.to_str().ok())
         {
-            check_write_conditions(state.engine.db.get_object(bucket, key)?, headers)?;
-            return copy_object(state, bucket, key, source, headers);
+            check_write_conditions(state.engine.db.get_object(bucket, key).await?, headers)?;
+            return copy_object(state, bucket, key, source, headers).await;
         }
-        check_write_conditions(state.engine.db.get_object(bucket, key)?, headers)?;
+        check_write_conditions(state.engine.db.get_object(bucket, key).await?, headers)?;
         let metadata = metadata_from_headers(headers);
         let length = headers
             .get(header::CONTENT_LENGTH)
@@ -253,16 +297,142 @@ async fn dispatch_object(
     } else if method == Method::GET || method == Method::HEAD {
         get_object(&state.engine, bucket, key, headers, method == Method::HEAD).await
     } else if method == Method::DELETE {
-        check_write_conditions(state.engine.db.get_object(bucket, key)?, headers)?;
-        let _ = state.engine.delete_object(bucket, key)?;
+        check_write_conditions(state.engine.db.get_object(bucket, key).await?, headers)?;
+        let _ = state.engine.delete_object(bucket, key).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     } else {
         Err(anyhow!("MethodNotAllowed"))
     }
 }
 
-fn list_buckets(engine: &Engine) -> Result<Response> {
-    let buckets = engine.db.list_buckets()?;
+async fn effective_cors(state: &AppState, uri: &Uri, headers: &HeaderMap) -> CorsConfiguration {
+    let Ok(target) = Target::parse(uri, headers, state.public_host.as_deref()) else {
+        return state.cors.clone();
+    };
+    let Some(bucket) = target.bucket else {
+        return state.cors.clone();
+    };
+    state
+        .engine
+        .db
+        .get_bucket_cors(&bucket)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| state.cors.clone())
+}
+
+async fn apply_cors(
+    state: &AppState,
+    uri: &Uri,
+    request_headers: &HeaderMap,
+    mut response: Response,
+) -> Response {
+    let Some(origin) = request_headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return response;
+    };
+    let cors = effective_cors(state, uri, request_headers).await;
+    let origin_allowed = cors
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(origin));
+    if !origin_allowed {
+        return response;
+    }
+    let allow_origin = if cors.allowed_origins.iter().any(|allowed| allowed == "*") {
+        "*"
+    } else {
+        origin
+    };
+    insert_header(
+        response.headers_mut(),
+        "Access-Control-Allow-Origin",
+        allow_origin,
+    );
+    insert_header(
+        response.headers_mut(),
+        "Access-Control-Allow-Methods",
+        &allow_methods(&cors).join(", "),
+    );
+    insert_header(
+        response.headers_mut(),
+        "Access-Control-Allow-Headers",
+        &cors.allowed_headers.join(", "),
+    );
+    insert_header(
+        response.headers_mut(),
+        "Access-Control-Expose-Headers",
+        &cors.expose_headers.join(", "),
+    );
+    insert_header(
+        response.headers_mut(),
+        "Access-Control-Max-Age",
+        &cors.max_age_seconds.to_string(),
+    );
+    insert_header(response.headers_mut(), header::VARY, "Origin");
+    response
+}
+
+fn allow_methods(cors: &CorsConfiguration) -> Vec<String> {
+    let mut methods = cors.allowed_methods.clone();
+    if !methods
+        .iter()
+        .any(|method| method.eq_ignore_ascii_case("OPTIONS"))
+    {
+        methods.push("OPTIONS".to_string());
+    }
+    methods
+}
+
+async fn get_bucket_cors(state: &AppState, bucket: &str) -> Result<Response> {
+    if !state.engine.db.bucket_exists(bucket).await? {
+        bail!("NoSuchBucket");
+    }
+    let configuration = effective_bucket_cors(state, bucket).await;
+    xml_response(CorsConfigurationXml::from(&configuration))
+}
+
+async fn put_bucket_cors(state: &AppState, bucket: &str, body: Body) -> Result<Response> {
+    if !state.engine.db.bucket_exists(bucket).await? {
+        bail!("NoSuchBucket");
+    }
+    let bytes = to_bytes(body, 1024 * 1024).await?;
+    let xml: CorsConfigurationXml =
+        from_str(std::str::from_utf8(&bytes).map_err(|_| anyhow!("MalformedXML"))?)
+            .map_err(|_| anyhow!("MalformedXML"))?;
+    let configuration = xml.into_configuration()?;
+    state
+        .engine
+        .db
+        .set_bucket_cors(bucket, &configuration)
+        .await?;
+    Ok(empty_response(StatusCode::OK))
+}
+
+async fn delete_bucket_cors(state: &AppState, bucket: &str) -> Result<Response> {
+    if !state.engine.db.bucket_exists(bucket).await? {
+        bail!("NoSuchBucket");
+    }
+    state.engine.db.delete_bucket_cors(bucket).await?;
+    Ok(empty_response(StatusCode::NO_CONTENT))
+}
+
+async fn effective_bucket_cors(state: &AppState, bucket: &str) -> CorsConfiguration {
+    state
+        .engine
+        .db
+        .get_bucket_cors(bucket)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| state.cors.clone())
+}
+
+async fn list_buckets(engine: &Engine) -> Result<Response> {
+    let buckets = engine.db.list_buckets().await?;
     let response = ListAllMyBuckets {
         buckets: Buckets {
             bucket: buckets
@@ -277,8 +447,12 @@ fn list_buckets(engine: &Engine) -> Result<Response> {
     xml_response(response)
 }
 
-fn list_objects(engine: &Engine, bucket: &str, query: &[(String, String)]) -> Result<Response> {
-    if !engine.db.bucket_exists(bucket)? {
+async fn list_objects(
+    engine: &Engine,
+    bucket: &str,
+    query: &[(String, String)],
+) -> Result<Response> {
+    if !engine.db.bucket_exists(bucket).await? {
         bail!("NoSuchBucket");
     }
     let prefix = query_value(query, "prefix").unwrap_or_default();
@@ -301,7 +475,8 @@ fn list_objects(engine: &Engine, bucket: &str, query: &[(String, String)]) -> Re
     }
     let entries = engine
         .db
-        .list_objects(bucket, &prefix, &after, max_keys + 1)?;
+        .list_objects(bucket, &prefix, &after, max_keys + 1)
+        .await?;
     let truncated = entries.len() > max_keys;
     let shown = entries.into_iter().take(max_keys).collect::<Vec<_>>();
     let mut contents = Vec::new();
@@ -368,7 +543,7 @@ async fn get_object(
     headers: &HeaderMap,
     head_only: bool,
 ) -> Result<Response> {
-    let object = engine.get_object(bucket, key)?;
+    let object = engine.get_object(bucket, key).await?;
     check_conditions(&object, headers)?;
     let (start, end, partial) = parse_range(
         headers
@@ -403,7 +578,7 @@ async fn get_object(
         .into_response())
 }
 
-fn copy_object(
+async fn copy_object(
     state: &AppState,
     bucket: &str,
     key: &str,
@@ -411,7 +586,7 @@ fn copy_object(
     headers: &HeaderMap,
 ) -> Result<Response> {
     let (source_bucket, source_key) = parse_copy_source(source)?;
-    let source_object = state.engine.get_object(&source_bucket, &source_key)?;
+    let source_object = state.engine.get_object(&source_bucket, &source_key).await?;
     check_copy_source_conditions(&source_object, headers)?;
     let metadata = if headers
         .get("x-amz-metadata-directive")
@@ -425,7 +600,8 @@ fn copy_object(
     };
     let object = state
         .engine
-        .copy_object(&source_bucket, &source_key, bucket, key, &metadata)?;
+        .copy_object(&source_bucket, &source_key, bucket, key, &metadata)
+        .await?;
     xml_response(CopyObjectResult {
         etag: quoted(&object.etag),
         last_modified: format_time(object.modified_at),
@@ -452,11 +628,12 @@ async fn complete_multipart(engine: &Engine, upload_id: &str, body: Body) -> Res
     })
 }
 
-fn list_parts(engine: &Engine, upload_id: String) -> Result<Response> {
-    let parts = engine.list_parts(&upload_id)?;
+async fn list_parts(engine: &Engine, upload_id: String) -> Result<Response> {
+    let parts = engine.list_parts(&upload_id).await?;
     let upload = engine
         .db
-        .get_upload(&upload_id)?
+        .get_upload(&upload_id)
+        .await?
         .ok_or_else(|| anyhow!("NoSuchUpload"))?;
     xml_response(ListPartsResult {
         bucket: upload.bucket,
@@ -474,12 +651,13 @@ fn list_parts(engine: &Engine, upload_id: String) -> Result<Response> {
     })
 }
 
-fn list_multipart_uploads(engine: &Engine, bucket: &str) -> Result<Response> {
-    if !engine.db.bucket_exists(bucket)? {
+async fn list_multipart_uploads(engine: &Engine, bucket: &str) -> Result<Response> {
+    if !engine.db.bucket_exists(bucket).await? {
         bail!("NoSuchBucket");
     }
     let uploads = engine
-        .list_uploads(bucket, None)?
+        .list_uploads(bucket, None)
+        .await?
         .into_iter()
         .filter(|upload| upload.kind == "multipart")
         .collect::<Vec<_>>();
@@ -504,7 +682,7 @@ async fn multi_delete(engine: &Engine, bucket: &str, body: Body) -> Result<Respo
     let mut deleted = Vec::new();
     for object in request.objects {
         let key = object.key;
-        let _ = engine.delete_object(bucket, &key)?;
+        let _ = engine.delete_object(bucket, &key).await?;
         deleted.push(DeletedXml { key });
     }
     xml_response(DeleteResult { deleted })
@@ -753,14 +931,13 @@ fn parse_range(value: Option<&str>, size: i64) -> Result<(i64, i64, bool)> {
 }
 
 fn validate_bucket(bucket: &str) -> Result<()> {
-    if bucket.len() < 3
+    if bucket.is_empty()
         || bucket.len() > 63
-        || !bucket.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
-        })
-        || !bucket.as_bytes()[0].is_ascii_lowercase() && !bucket.as_bytes()[0].is_ascii_digit()
-        || !bucket.as_bytes()[bucket.len() - 1].is_ascii_lowercase()
-            && !bucket.as_bytes()[bucket.len() - 1].is_ascii_digit()
+        || !bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+        || !bucket.as_bytes()[0].is_ascii_alphanumeric()
+        || !bucket.as_bytes()[bucket.len() - 1].is_ascii_alphanumeric()
     {
         bail!("InvalidBucketName");
     }
@@ -823,7 +1000,7 @@ mod tests {
         assert_eq!(target.bucket.as_deref(), Some("my-bucket"));
         assert_eq!(target.key.as_deref(), Some("folder/file.txt"));
         assert!(validate_bucket("my-bucket").is_ok());
-        assert!(validate_bucket("BadBucket").is_err());
+        assert!(validate_bucket("bad_bucket").is_err());
         Ok(())
     }
 }
@@ -1052,6 +1229,92 @@ struct BucketLocation {
     #[serde(rename = "LocationConstraint")]
     location: String,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "CORSConfiguration")]
+struct CorsConfigurationXml {
+    #[serde(rename = "CORSRule", default)]
+    rules: Vec<CorsRuleXml>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CorsRuleXml {
+    #[serde(rename = "AllowedOrigin", default)]
+    allowed_origins: Vec<String>,
+    #[serde(rename = "AllowedMethod", default)]
+    allowed_methods: Vec<String>,
+    #[serde(rename = "AllowedHeader", default)]
+    allowed_headers: Vec<String>,
+    #[serde(rename = "ExposeHeader", default)]
+    expose_headers: Vec<String>,
+    #[serde(rename = "MaxAgeSeconds", default)]
+    max_age_seconds: Option<u64>,
+}
+
+impl CorsConfigurationXml {
+    fn from(configuration: &CorsConfiguration) -> Self {
+        Self {
+            rules: vec![CorsRuleXml {
+                allowed_origins: configuration.allowed_origins.clone(),
+                allowed_methods: configuration.allowed_methods.clone(),
+                allowed_headers: configuration.allowed_headers.clone(),
+                expose_headers: configuration.expose_headers.clone(),
+                max_age_seconds: Some(configuration.max_age_seconds),
+            }],
+        }
+    }
+
+    fn into_configuration(self) -> Result<CorsConfiguration> {
+        if self.rules.is_empty() {
+            bail!("InvalidRequest");
+        }
+        let mut configuration = CorsConfiguration {
+            allowed_origins: Vec::new(),
+            allowed_methods: Vec::new(),
+            allowed_headers: Vec::new(),
+            expose_headers: Vec::new(),
+            max_age_seconds: 3600,
+        };
+        for rule in self.rules {
+            configuration.allowed_origins.extend(rule.allowed_origins);
+            configuration.allowed_methods.extend(
+                rule.allowed_methods
+                    .into_iter()
+                    .map(|method| method.to_ascii_uppercase()),
+            );
+            configuration.allowed_headers.extend(rule.allowed_headers);
+            configuration.expose_headers.extend(rule.expose_headers);
+            if let Some(max_age) = rule.max_age_seconds {
+                configuration.max_age_seconds = max_age;
+            }
+        }
+        for values in [
+            &mut configuration.allowed_origins,
+            &mut configuration.allowed_methods,
+            &mut configuration.allowed_headers,
+            &mut configuration.expose_headers,
+        ] {
+            values.sort_unstable();
+            values.dedup();
+        }
+        if configuration.allowed_origins.is_empty()
+            || configuration.allowed_methods.is_empty()
+            || configuration.allowed_headers.is_empty()
+        {
+            bail!("InvalidRequest");
+        }
+        if configuration
+            .allowed_origins
+            .iter()
+            .any(|origin| origin == "*")
+            && configuration.allowed_origins.len() > 1
+        {
+            bail!("InvalidRequest");
+        }
+        Ok(configuration)
+    }
+}
+
 #[derive(Serialize)]
 struct InitiateMultipartUpload {
     #[serde(rename = "Bucket")]
