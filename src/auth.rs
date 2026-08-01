@@ -20,6 +20,16 @@ pub struct SigV4 {
 
 impl SigV4 {
     pub fn verify(&self, method: &Method, uri: &Uri, headers: &HeaderMap) -> Result<()> {
+        self.verify_with_payload_hash(method, uri, headers, None)
+    }
+
+    pub fn verify_with_payload_hash(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        payload_hash_override: Option<&str>,
+    ) -> Result<()> {
         let Some(access_key) = &self.access_key else {
             if self.allow_anonymous {
                 return Ok(());
@@ -127,6 +137,7 @@ impl SigV4 {
         let payload_hash = headers
             .get("x-amz-content-sha256")
             .and_then(|value| value.to_str().ok())
+            .or(payload_hash_override)
             .unwrap_or_else(|| {
                 if *method == Method::GET || *method == Method::HEAD {
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -134,27 +145,34 @@ impl SigV4 {
                     "UNSIGNED-PAYLOAD"
                 }
             });
-        let canonical_request = format!(
-            "{}\n{}\n{}\n{}\n\n{}\n{}",
-            method,
-            canonical_uri(uri.path()),
-            canonical_query(&query, presigned),
-            canonical_headers(headers, &signed_headers)?,
-            signed_headers,
-            payload_hash,
-        );
         let scope = format!("{}/{}/{}/aws4_request", date, self.region, "s3");
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            amz_date,
-            scope,
-            hex::encode(Sha256::digest(canonical_request.as_bytes()))
-        );
         let signing_key = signing_key(secret_key, date, &self.region, "s3")?;
-        let expected = hex::encode(hmac_bytes(&signing_key, string_to_sign.as_bytes())?);
-        if expected.len() != signature.len()
-            || expected.as_bytes().ct_eq(signature.as_bytes()).unwrap_u8() != 1
-        {
+        let signature_matches = |payload_hash: &str| -> Result<bool> {
+            let canonical_request = format!(
+                "{}\n{}\n{}\n{}\n\n{}\n{}",
+                method,
+                canonical_uri(uri.path()),
+                canonical_query(&query, presigned),
+                canonical_headers(headers, &signed_headers)?,
+                signed_headers,
+                payload_hash,
+            );
+            let string_to_sign = format!(
+                "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+                amz_date,
+                scope,
+                hex::encode(Sha256::digest(canonical_request.as_bytes()))
+            );
+            let expected = hex::encode(hmac_bytes(&signing_key, string_to_sign.as_bytes())?);
+            Ok(expected.len() == signature.len()
+                && expected.as_bytes().ct_eq(signature.as_bytes()).unwrap_u8() == 1)
+        };
+        let matches = signature_matches(payload_hash)?;
+        let matches_unsigned = !matches
+            && payload_hash_override.is_some()
+            && !headers.contains_key("x-amz-content-sha256")
+            && signature_matches("UNSIGNED-PAYLOAD")?;
+        if !matches && !matches_unsigned {
             bail!("SignatureDoesNotMatch");
         }
         Ok(())
@@ -165,7 +183,9 @@ fn canonical_uri(path: &str) -> String {
     if path.is_empty() {
         "/".to_string()
     } else {
-        aws_encode_path(path)
+        // S3's AWS SDK signer already uses the escaped request path and
+        // disables an additional URI escaping pass.
+        path.to_string()
     }
 }
 
@@ -184,7 +204,7 @@ fn canonical_query(query: &[(String, String)], omit_signature: bool) -> String {
 }
 
 fn canonical_headers(headers: &HeaderMap, signed_headers: &str) -> Result<String> {
-    let mut result = String::new();
+    let mut result = Vec::new();
     for name in signed_headers.split(';') {
         let name = name.trim().to_ascii_lowercase();
         if name.is_empty() {
@@ -195,12 +215,9 @@ fn canonical_headers(headers: &HeaderMap, signed_headers: &str) -> Result<String
             .ok_or_else(|| anyhow!("Signed header missing"))?
             .to_str()
             .map_err(|_| anyhow!("Invalid signed header"))?;
-        result.push_str(&name);
-        result.push(':');
-        result.push_str(&collapse_spaces(value));
-        result.push('\n');
+        result.push(format!("{}:{}", name, collapse_spaces(value)));
     }
-    Ok(result)
+    Ok(result.join("\n"))
 }
 
 fn collapse_spaces(value: &str) -> String {
@@ -219,14 +236,6 @@ fn aws_encode(value: &str) -> String {
         }
     }
     output
-}
-
-fn aws_encode_path(value: &str) -> String {
-    value
-        .split('/')
-        .map(aws_encode)
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn parse_amz_date(value: &str) -> Result<OffsetDateTime> {
@@ -326,6 +335,108 @@ mod tests {
             verifier
                 .verify(request.method(), request.uri(), request.headers())
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verifies_put_signature_with_payload_hash_override() -> Result<()> {
+        let method = Method::PUT;
+        let uri: Uri = "/A?cors".parse()?;
+        let body = br#"<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>"#;
+        let payload_hash = hex::encode(Sha256::digest(body));
+        let mut request = Request::builder()
+            .method(method.clone())
+            .uri(uri.clone())
+            .header("host", "localhost:9000")
+            .body(())?;
+        let now = OffsetDateTime::now_utc();
+        let format =
+            time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
+        let amz_date = now.format(format)?;
+        request
+            .headers_mut()
+            .insert("x-amz-date", HeaderValue::from_str(&amz_date)?);
+        let date = &amz_date[..8];
+        let credential = format!("AKIDEXAMPLE/{date}/us-east-1/s3/aws4_request");
+        let signed_headers = "host;x-amz-date";
+        let canonical_request = format!(
+            "PUT\n{}\n{}\n{}\n\n{}\n{}",
+            canonical_uri(uri.path()),
+            canonical_query(
+                &form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                    .into_owned()
+                    .collect::<Vec<_>>(),
+                false
+            ),
+            canonical_headers(request.headers(), signed_headers)?,
+            signed_headers,
+            payload_hash,
+        );
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let key = signing_key("secret", date, "us-east-1", "s3")?;
+        let signature = hex::encode(hmac_bytes(&key, string_to_sign.as_bytes())?);
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential={credential}, SignedHeaders={signed_headers}, Signature={signature}"
+            ))?,
+        );
+
+        let verifier = SigV4 {
+            access_key: Some("AKIDEXAMPLE".to_string()),
+            secret_key: Some("secret".to_string()),
+            region: "us-east-1".to_string(),
+            allow_anonymous: false,
+        };
+        verifier.verify_with_payload_hash(
+            request.method(),
+            request.uri(),
+            request.headers(),
+            Some(&payload_hash),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_preescaped_s3_paths() {
+        assert_eq!(
+            canonical_uri("/A/folder%2Fname%20with%20space"),
+            "/A/folder%2Fname%20with%20space"
+        );
+    }
+
+    #[test]
+    fn canonical_request_matches_aws_sdk_v1_layout() -> Result<()> {
+        let method = Method::GET;
+        let uri: Uri =
+            "/A/uploads/1/69371da6-64aa-49d3-9a69-89e15f3361b2_vidu-video-3399804535125746.mp4"
+                .parse()?;
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("tgs3.example.test"));
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+        );
+        headers.insert("x-amz-date", HeaderValue::from_static("20260801T162829Z"));
+        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let canonical_request = format!(
+            "{}\n{}\n\n{}\n\n{}\n{}",
+            method,
+            canonical_uri(uri.path()),
+            canonical_headers(&headers, signed_headers)?,
+            signed_headers,
+            headers.get("x-amz-content-sha256").unwrap().to_str()?,
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(canonical_request.as_bytes())),
+            "6a5cbd56a212306383d0d9e59ec8d8a9e422fd84d445c7f14403d757c3f25b40"
         );
         Ok(())
     }

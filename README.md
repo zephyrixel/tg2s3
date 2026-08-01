@@ -64,6 +64,12 @@ Cloudreve may call `PutBucketCors`; that configuration is stored as a
 Bucket-level override in SQLite. Deleting the override returns to the
 environment-variable defaults.
 
+Set `RUST_LOG=info` to see S3 request and response status logs. Authentication
+failures include the request path, Host, signed-header list, and payload hash
+diagnostics without logging credentials or presigned query strings. If a
+reverse proxy is used, it must preserve the original `Host` header used by
+Cloudreve for SigV4 signing; do not mount tg2s3 under a URL path prefix.
+
 ## Compatibility
 
 The implemented surface includes bucket/object CRUD, ListObjects and

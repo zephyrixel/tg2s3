@@ -10,6 +10,7 @@ use axum::routing::get;
 use base64::Engine as _;
 use quick_xml::{de::from_str, se::to_string};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -53,13 +54,63 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (parts, body) = request.into_parts();
+    let (parts, mut body) = request.into_parts();
     let request_id = Uuid::new_v4().simple().to_string();
     let request_uri = parts.uri.clone();
     let request_headers = parts.headers.clone();
+    let query_keys = query_keys(&parts.uri);
+    let is_cors_put = parts.method == Method::PUT
+        && form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
+            .any(|(key, _)| key.eq_ignore_ascii_case("cors"));
+    let payload_hash = if is_cors_put && !parts.headers.contains_key("x-amz-content-sha256") {
+        match to_bytes(body, 1024 * 1024).await {
+            Ok(bytes) => {
+                let hash = hex::encode(Sha256::digest(&bytes));
+                body = Body::from(bytes);
+                Some(hash)
+            }
+            Err(error) => {
+                let response = error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest".to_string(),
+                    &format!("read CORS request body: {error}"),
+                    &request_uri,
+                    &request_id,
+                );
+                return apply_cors(&state, &request_uri, &request_headers, response).await;
+            }
+        }
+    } else {
+        None
+    };
     if parts.method != Method::OPTIONS
-        && let Err(error) = state.auth.verify(&parts.method, &parts.uri, &parts.headers)
+        && let Err(error) = state.auth.verify_with_payload_hash(
+            &parts.method,
+            &parts.uri,
+            &parts.headers,
+            payload_hash.as_deref(),
+        )
     {
+        tracing::warn!(
+            request_id = %request_id,
+            method = %parts.method,
+            path = %parts.uri.path(),
+            query_keys = ?query_keys,
+            host = ?parts.headers.get(header::HOST).and_then(|value| value.to_str().ok()),
+            signed_headers = ?parts
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split("SignedHeaders=").nth(1))
+                .and_then(|value| value.split(',').next()),
+            content_sha256 = ?parts
+                .headers
+                .get("x-amz-content-sha256")
+                .and_then(|value| value.to_str().ok()),
+            computed_payload_sha256 = ?payload_hash,
+            error = %error,
+            "S3 request authentication failed"
+        );
         return apply_cors(
             &state,
             &request_uri,
@@ -74,6 +125,15 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
         )
         .await;
     }
+    tracing::info!(
+        request_id = %request_id,
+        method = %parts.method,
+        path = %request_uri.path(),
+        query_keys = ?query_keys,
+        host = ?request_headers.get(header::HOST).and_then(|value| value.to_str().ok()),
+        "S3 request received"
+    );
+    let request_method = parts.method.clone();
     let response = match dispatch(
         &state,
         parts.method,
@@ -85,14 +145,26 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
     .await
     {
         Ok(response) => response,
-        Err(error) => error_response(
-            status_for(&error),
-            error_code(&error),
-            &error.to_string(),
-            &request_uri,
-            &request_id,
-        ),
+        Err(error) => {
+            let status = status_for(&error);
+            let code = error_code(&error);
+            tracing::error!(
+                request_id = %request_id,
+                method = %request_method,
+                path = %request_uri.path(),
+                status = %status,
+                code = %code,
+                error = %error,
+                "S3 request failed"
+            );
+            error_response(status, code, &error.to_string(), &request_uri, &request_id)
+        }
     };
+    tracing::info!(
+        request_id = %request_id,
+        status = %response.status(),
+        "S3 request completed"
+    );
     apply_cors(&state, &request_uri, &request_headers, response).await
 }
 
@@ -947,6 +1019,13 @@ fn validate_bucket(bucket: &str) -> Result<()> {
 fn query_has(query: &[(String, String)], name: &str) -> bool {
     query.iter().any(|(key, _)| key == name)
 }
+
+fn query_keys(uri: &Uri) -> Vec<String> {
+    form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .map(|(key, _)| key.into_owned())
+        .collect()
+}
+
 fn query_value(query: &[(String, String)], name: &str) -> Option<String> {
     query
         .iter()
@@ -1001,6 +1080,23 @@ mod tests {
         assert_eq!(target.key.as_deref(), Some("folder/file.txt"));
         assert!(validate_bucket("my-bucket").is_ok());
         assert!(validate_bucket("bad_bucket").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serializes_standard_s3_error_root() -> Result<()> {
+        let uri: Uri = "/A".parse()?;
+        let response = error_response(
+            StatusCode::FORBIDDEN,
+            "SignatureDoesNotMatch".to_string(),
+            "signature mismatch",
+            &uri,
+            "request-1",
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await?;
+        let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"));
+        assert!(!body.contains("<ErrorXml"));
         Ok(())
     }
 }
@@ -1391,6 +1487,7 @@ struct DeletedXml {
     key: String,
 }
 #[derive(Serialize)]
+#[serde(rename = "Error")]
 struct ErrorXml {
     #[serde(rename = "Code")]
     code: String,
