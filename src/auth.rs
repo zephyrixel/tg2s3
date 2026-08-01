@@ -139,7 +139,9 @@ impl SigV4 {
             .and_then(|value| value.to_str().ok())
             .or(payload_hash_override)
             .unwrap_or_else(|| {
-                if *method == Method::GET || *method == Method::HEAD {
+                if presigned {
+                    "UNSIGNED-PAYLOAD"
+                } else if *method == Method::GET || *method == Method::HEAD {
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 } else {
                     "UNSIGNED-PAYLOAD"
@@ -438,6 +440,44 @@ mod tests {
             hex::encode(Sha256::digest(canonical_request.as_bytes())),
             "6a5cbd56a212306383d0d9e59ec8d8a9e422fd84d445c7f14403d757c3f25b40"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn verifies_s3_presigned_get_with_unsigned_payload() -> Result<()> {
+        let method = Method::GET;
+        let uri: Uri = "/A/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20260801%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260801T162829Z&X-Amz-Expires=3599&X-Amz-SignedHeaders=host&X-Amz-Signature=placeholder".parse()?;
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:9000"));
+        let verifier = SigV4 {
+            access_key: Some("AKIDEXAMPLE".to_string()),
+            secret_key: Some("secret".to_string()),
+            region: "us-east-1".to_string(),
+            allow_anonymous: false,
+        };
+        let query: Vec<(String, String)> =
+            form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect();
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n\n{}\n{}",
+            method,
+            canonical_uri(uri.path()),
+            canonical_query(&query, true),
+            canonical_headers(&headers, "host")?,
+            "host",
+            "UNSIGNED-PAYLOAD",
+        );
+        let amz_date = "20260801T162829Z";
+        let scope = "20260801/us-east-1/s3/aws4_request";
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let key = signing_key("secret", "20260801", "us-east-1", "s3")?;
+        let signature = hex::encode(hmac_bytes(&key, string_to_sign.as_bytes())?);
+        let uri = uri.to_string().replace("placeholder", &signature).parse()?;
+        verifier.verify(&method, &uri, &headers)?;
         Ok(())
     }
 }
