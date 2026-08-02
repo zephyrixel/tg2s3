@@ -1,6 +1,7 @@
 use crate::model::GarbageRecord;
 use anyhow::{Context, Result};
 use sqlx::Row;
+use sqlx::sqlite::SqliteRow;
 
 use super::Db;
 use super::support::{now, parse_backend};
@@ -22,24 +23,29 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                let backend = parse_backend(row.get("backend"))?;
-                Ok(GarbageRecord {
-                    block_id: row.get("block_id"),
-                    chat_id: row.get("chat_id"),
-                    message_id: row.get("message_id"),
-                    backend,
-                    document_id: row.get("document_id"),
-                    file_id: row.get("file_id"),
-                    file_unique_id: row.get("file_unique_id"),
-                    message_date: row.get("message_date"),
-                    attempts: row.get("attempts"),
-                    next_attempt: row.get("next_attempt"),
-                    last_error: row.get("last_error"),
-                })
-            })
-            .collect()
+        rows.into_iter().map(garbage_from_row).collect()
+    }
+
+    pub async fn gc_candidate(
+        &self,
+        block_id: i64,
+        timestamp: i64,
+    ) -> Result<Option<GarbageRecord>> {
+        let row = sqlx::query(
+            "SELECT q.block_id, b.chat_id, b.message_id, b.backend, b.document_id,
+                    b.file_id, b.file_unique_id, b.message_date,
+                    q.attempts, q.next_attempt, q.last_error
+             FROM gc_queue q JOIN telegram_blocks b ON b.id = q.block_id
+             WHERE q.block_id = ?1 AND q.state = 'pending'
+               AND b.ref_count = 0 AND q.next_attempt <= ?2
+               AND NOT EXISTS(SELECT 1 FROM object_blocks WHERE block_id = b.id)
+               AND NOT EXISTS(SELECT 1 FROM multipart_part_blocks WHERE block_id = b.id)",
+        )
+        .bind(block_id)
+        .bind(timestamp)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(garbage_from_row).transpose()
     }
 
     pub async fn gc_success(&self, block_id: i64) -> Result<()> {
@@ -167,4 +173,21 @@ impl Db {
         tx.commit().await?;
         Ok(queued)
     }
+}
+
+fn garbage_from_row(row: SqliteRow) -> Result<GarbageRecord> {
+    let backend = parse_backend(row.get("backend"))?;
+    Ok(GarbageRecord {
+        block_id: row.get("block_id"),
+        chat_id: row.get("chat_id"),
+        message_id: row.get("message_id"),
+        backend,
+        document_id: row.get("document_id"),
+        file_id: row.get("file_id"),
+        file_unique_id: row.get("file_unique_id"),
+        message_date: row.get("message_date"),
+        attempts: row.get("attempts"),
+        next_attempt: row.get("next_attempt"),
+        last_error: row.get("last_error"),
+    })
 }

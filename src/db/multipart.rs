@@ -1,12 +1,12 @@
 use crate::model::{BlockRef, ObjectCondition, ObjectRecord, PartRecord, UploadRecord};
 use anyhow::{Result, anyhow, bail};
 use sqlx::Row;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Db;
 use super::support::{
     block_from_row, decrement_block, ensure_blocks_not_queued, load_object_blocks_tx, now,
-    upload_from_row, validate_parts_layout,
+    upload_from_row, validate_parts_layout, verify_parts_tx,
 };
 
 impl Db {
@@ -92,7 +92,7 @@ impl Db {
         size: i64,
         etag: &str,
         block_ids: &[BlockRef],
-    ) -> Result<()> {
+    ) -> Result<Vec<BlockRef>> {
         let mut tx = self.pool.begin().await?;
         let upload_lock = sqlx::query(
             "UPDATE multipart_uploads SET created_at = created_at WHERE upload_id = ?1",
@@ -105,9 +105,18 @@ impl Db {
         }
         let queued_ids = block_ids.iter().map(|block| block.id).collect::<Vec<_>>();
         ensure_blocks_not_queued(&mut tx, &queued_ids).await?;
+        let mut new_block_ids = HashSet::with_capacity(block_ids.len());
+        if block_ids
+            .iter()
+            .any(|block| !new_block_ids.insert(block.id))
+        {
+            bail!("InvalidPart");
+        }
         let old = sqlx::query(
-            "SELECT block_id FROM multipart_part_blocks
-             WHERE upload_id = ?1 AND part_number = ?2",
+            "SELECT b.id, pb.ordinal, pb.byte_offset, pb.size, b.chat_id, b.message_id,
+                    b.backend, b.document_id, b.file_id, b.file_unique_id, b.message_date
+             FROM multipart_part_blocks pb JOIN telegram_blocks b ON b.id = pb.block_id
+             WHERE pb.upload_id = ?1 AND pb.part_number = ?2 ORDER BY pb.ordinal",
         )
         .bind(upload_id)
         .bind(part_number)
@@ -118,8 +127,13 @@ impl Db {
             .bind(part_number)
             .execute(&mut *tx)
             .await?;
+        let mut released = Vec::new();
         for row in old {
-            decrement_block(&mut tx, row.get("block_id")).await?;
+            let block = block_from_row(row)?;
+            if !new_block_ids.contains(&block.id) {
+                decrement_block(&mut tx, block.id).await?;
+                released.push(block);
+            }
         }
         sqlx::query(
             "INSERT INTO multipart_parts(upload_id, part_number, size, etag)
@@ -147,7 +161,7 @@ impl Db {
             .await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(released)
     }
 
     pub async fn get_parts(
@@ -222,11 +236,6 @@ impl Db {
             tx.rollback().await?;
             return Ok(None);
         }
-        let block_ids = parts
-            .iter()
-            .flat_map(|part| part.blocks.iter().map(|block| block.id))
-            .collect::<Vec<_>>();
-        ensure_blocks_not_queued(&mut tx, &block_ids).await?;
         let upload = sqlx::query(
             "SELECT upload_id, bucket, object_key, metadata_json, kind, created_at
              FROM multipart_uploads WHERE upload_id = ?1",
@@ -238,6 +247,12 @@ impl Db {
             tx.rollback().await?;
             return Ok(None);
         };
+        verify_parts_tx(&mut tx, upload_id, parts).await?;
+        let block_ids = parts
+            .iter()
+            .flat_map(|part| part.blocks.iter().map(|block| block.id))
+            .collect::<Vec<_>>();
+        ensure_blocks_not_queued(&mut tx, &block_ids).await?;
         let bucket: String = upload.get("bucket");
         let key: String = upload.get("object_key");
         let metadata_json: String = upload.get("metadata_json");
@@ -326,28 +341,42 @@ impl Db {
     }
 
     pub async fn abort_upload(&self, upload_id: &str) -> Result<bool> {
+        Ok(self.abort_upload_with_blocks(upload_id).await?.is_some())
+    }
+
+    pub async fn abort_upload_with_blocks(&self, upload_id: &str) -> Result<Option<Vec<BlockRef>>> {
         let mut tx = self.pool.begin().await?;
-        let exists = sqlx::query("SELECT 1 FROM multipart_uploads WHERE upload_id = ?1")
-            .bind(upload_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some();
-        if !exists {
+        let upload_lock = sqlx::query(
+            "UPDATE multipart_uploads SET created_at = created_at WHERE upload_id = ?1",
+        )
+        .bind(upload_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if upload_lock != 1 {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(None);
         }
-        let ids = sqlx::query("SELECT block_id FROM multipart_part_blocks WHERE upload_id = ?1")
-            .bind(upload_id)
-            .fetch_all(&mut *tx)
-            .await?;
+        let blocks = sqlx::query(
+            "SELECT b.id, pb.ordinal, pb.byte_offset, pb.size, b.chat_id, b.message_id,
+                    b.backend, b.document_id, b.file_id, b.file_unique_id, b.message_date
+             FROM multipart_part_blocks pb JOIN telegram_blocks b ON b.id = pb.block_id
+             WHERE pb.upload_id = ?1 ORDER BY pb.part_number, pb.ordinal",
+        )
+        .bind(upload_id)
+        .fetch_all(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?1")
             .bind(upload_id)
             .execute(&mut *tx)
             .await?;
-        for row in ids {
-            decrement_block(&mut tx, row.get("block_id")).await?;
+        let mut released = Vec::with_capacity(blocks.len());
+        for row in blocks {
+            let block = block_from_row(row)?;
+            decrement_block(&mut tx, block.id).await?;
+            released.push(block);
         }
         tx.commit().await?;
-        Ok(true)
+        Ok(Some(released))
     }
 }

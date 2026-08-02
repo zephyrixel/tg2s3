@@ -1,8 +1,10 @@
-use crate::model::{BlockRef, ObjectMetadata, PartRecord, TelegramBackend, UploadRecord};
+use crate::model::{
+    BlockRef, ObjectMetadata, PartRecord, TelegramBackend, UploadRecord, normalize_etag,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn now() -> i64 {
@@ -161,6 +163,72 @@ pub(super) async fn ensure_blocks_not_queued(
     separated.push_unseparated(")");
     if query.build().fetch_optional(&mut **tx).await?.is_some() {
         bail!("SlowDown: upload block is pending garbage collection");
+    }
+    Ok(())
+}
+
+pub(super) async fn verify_parts_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    upload_id: &str,
+    parts: &[PartRecord],
+) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT part_number, size, etag FROM multipart_parts
+         WHERE upload_id = ?1 ORDER BY part_number",
+    )
+    .bind(upload_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut expected = HashMap::with_capacity(parts.len());
+    for part in parts {
+        if expected.insert(part.part_number, part).is_some() {
+            bail!("InvalidPart");
+        }
+    }
+    if rows.len() != expected.len() {
+        bail!("InvalidPart");
+    }
+
+    let block_rows = sqlx::query(
+        "SELECT part_number, ordinal, block_id, byte_offset, size
+         FROM multipart_part_blocks WHERE upload_id = ?1
+         ORDER BY part_number, ordinal",
+    )
+    .bind(upload_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut persisted_blocks: HashMap<i32, Vec<(i64, i64, i64)>> = HashMap::new();
+    for row in block_rows {
+        persisted_blocks
+            .entry(row.get("part_number"))
+            .or_default()
+            .push((row.get("block_id"), row.get("byte_offset"), row.get("size")));
+    }
+
+    for row in rows {
+        let part_number: i32 = row.get("part_number");
+        let Some(part) = expected.remove(&part_number) else {
+            bail!("InvalidPart");
+        };
+        let size: i64 = row.get("size");
+        let etag: String = row.get("etag");
+        if size != part.size || normalize_etag(&etag) != normalize_etag(&part.etag) {
+            bail!("InvalidPart");
+        }
+        let actual = persisted_blocks.remove(&part_number).unwrap_or_default();
+        if actual.len() != part.blocks.len()
+            || actual
+                .iter()
+                .zip(&part.blocks)
+                .any(|((id, offset, size), block)| {
+                    *id != block.id || *offset != block.offset || *size != block.size
+                })
+        {
+            bail!("InvalidPart");
+        }
+    }
+    if !expected.is_empty() || !persisted_blocks.is_empty() {
+        bail!("InvalidPart");
     }
     Ok(())
 }

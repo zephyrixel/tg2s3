@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 struct MockState {
     files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     next_id: Arc<std::sync::atomic::AtomicI64>,
+    delete_count: Arc<std::sync::atomic::AtomicUsize>,
     upload_started: Arc<Notify>,
 }
 
@@ -80,6 +81,9 @@ async fn mock_telegram(State(state): State<MockState>, request: Request<Body>) -
         ));
     }
     if path.ends_with("/deleteMessage") {
+        state
+            .delete_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         return json_response(r#"{"ok":true,"result":true}"#);
     }
     if path.contains("/file/bot") {
@@ -189,8 +193,10 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
     let state = MockState {
         files: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+        delete_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         upload_started: Arc::new(Notify::new()),
     };
+    let delete_count = state.delete_count.clone();
     let upload_started = state.upload_started.clone();
     let app = axum::Router::new()
         .fallback(mock_telegram)
@@ -370,6 +376,29 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
     );
     let response = client.put(&endpoint).body("abcdef").send().await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let delete_count_before_failed_replace = delete_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        engine
+            .put_object(
+                "bucket",
+                "http-key",
+                Body::from("replace"),
+                ObjectMetadata::default(),
+                Some(7),
+                ObjectCondition {
+                    if_match: Some("\"stale-etag\"".to_string()),
+                    ..ObjectCondition::default()
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        delete_count.load(std::sync::atomic::Ordering::SeqCst),
+        delete_count_before_failed_replace + 1
+    );
+
     let response = client
         .put(&endpoint)
         .header("if-match", "\"stale-etag\"")
@@ -486,9 +515,14 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
         .await?;
     assert!(listing.contains("http-key"));
     assert!(listing.contains("copied"));
+    let delete_count_before_object_delete = delete_count.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         client.delete(&endpoint).send().await?.status(),
         reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        delete_count.load(std::sync::atomic::Ordering::SeqCst),
+        delete_count_before_object_delete
     );
 
     let multipart_base = format!("http://{s3_address}/bucket/multipart");
@@ -529,6 +563,76 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
     assert_eq!(
         client.get(&multipart_base).send().await?.bytes().await?,
         Bytes::from_static(b"part-data")
+    );
+
+    let mutable_base = format!("http://{s3_address}/bucket/mutable");
+    let initiate = client
+        .post(format!("{mutable_base}?uploads"))
+        .send()
+        .await?;
+    assert_eq!(initiate.status(), reqwest::StatusCode::OK);
+    let mutable_upload_id = initiate
+        .text()
+        .await?
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|value| value.split("</UploadId>").next())
+        .ok_or_else(|| anyhow!("missing mutable multipart upload id"))?
+        .to_string();
+    assert_eq!(
+        client
+            .put(format!(
+                "{mutable_base}?partNumber=1&uploadId={mutable_upload_id}"
+            ))
+            .body("first")
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let delete_count_before_part_replace = delete_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        client
+            .put(format!(
+                "{mutable_base}?partNumber=1&uploadId={mutable_upload_id}"
+            ))
+            .body("second")
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        delete_count.load(std::sync::atomic::Ordering::SeqCst),
+        delete_count_before_part_replace + 1
+    );
+    let delete_count_before_abort = delete_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        client
+            .delete(format!("{mutable_base}?uploadId={mutable_upload_id}"))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        delete_count.load(std::sync::atomic::Ordering::SeqCst),
+        delete_count_before_abort + 1
+    );
+
+    let delete_count_before_shared_copy_delete =
+        delete_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        client
+            .delete(format!("http://{s3_address}/bucket/copied"))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        delete_count.load(std::sync::atomic::Ordering::SeqCst),
+        delete_count_before_shared_copy_delete + 1
     );
     Ok(())
 }

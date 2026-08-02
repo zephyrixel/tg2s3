@@ -52,15 +52,19 @@ impl Engine {
         let (part, size) = self
             .upload_stream(upload_id, part_number, body, expected_length)
             .await?;
-        if let Err(error) = self
+        let released_blocks = match self
             .db
             .replace_part(upload_id, part_number, size, &part.etag, &part.blocks)
             .await
         {
-            crate::transfer::cleanup_block_refs(&self.db, &self.telegram, part.blocks.clone())
-                .await;
-            return Err(error);
-        }
+            Ok(released_blocks) => released_blocks,
+            Err(error) => {
+                crate::transfer::cleanup_block_refs(&self.db, &self.telegram, part.blocks.clone())
+                    .await;
+                return Err(error);
+            }
+        };
+        self.reclaim_blocks(released_blocks).await;
         Ok(PartRecord {
             upload_id: upload_id.to_string(),
             part_number,
@@ -123,7 +127,7 @@ impl Engine {
             ordered.push(part.clone());
         }
         let etag = format!("{:x}-{}", composite.finalize(), requested.len());
-        let (object, _) = self
+        let (object, released_blocks) = self
             .db
             .commit_upload(
                 upload_id,
@@ -134,6 +138,7 @@ impl Engine {
             )
             .await?
             .ok_or_else(|| anyhow!("NoSuchUpload"))?;
+        self.reclaim_blocks(released_blocks).await;
         Ok(object)
     }
 
@@ -150,6 +155,11 @@ impl Engine {
     }
 
     pub async fn abort_multipart(&self, upload_id: &str) -> Result<bool> {
-        self.db.abort_upload(upload_id).await
+        let released_blocks = self.db.abort_upload_with_blocks(upload_id).await?;
+        let Some(released_blocks) = released_blocks else {
+            return Ok(false);
+        };
+        self.reclaim_blocks(released_blocks).await;
+        Ok(true)
     }
 }

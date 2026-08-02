@@ -40,27 +40,40 @@ impl Engine {
                     "request Content-Length {expected} does not match body length {actual_length}"
                 );
             }
-            if let Err(error) = self
+            let released_blocks = match self
                 .db
                 .replace_part(&upload_id, 0, actual_length, &part.etag, &part.blocks)
                 .await
             {
-                crate::transfer::cleanup_block_refs(&self.db, &self.telegram, part.blocks.clone())
+                Ok(released_blocks) => released_blocks,
+                Err(error) => {
+                    crate::transfer::cleanup_block_refs(
+                        &self.db,
+                        &self.telegram,
+                        part.blocks.clone(),
+                    )
                     .await;
-                return Err(error);
-            }
+                    return Err(error);
+                }
+            };
+            self.reclaim_blocks(released_blocks).await;
             let etag = part.etag.clone();
-            let committed = self
+            let (object, released_blocks) = self
                 .db
                 .commit_upload(&upload_id, actual_length, &etag, &[part], &condition)
                 .await?
                 .ok_or_else(|| anyhow!("upload disappeared"))?;
-            Ok(committed.0)
+            self.reclaim_blocks(released_blocks).await;
+            Ok(object)
         }
         .await;
         if result.is_err() {
-            if let Err(error) = self.db.abort_upload(&upload_id).await {
-                tracing::error!(upload_id, error = %error, "failed to abort failed object upload");
+            match self.db.abort_upload_with_blocks(&upload_id).await {
+                Ok(Some(blocks)) => self.reclaim_blocks(blocks).await,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(upload_id, error = %error, "failed to abort failed object upload");
+                }
             }
         }
         result
@@ -84,11 +97,12 @@ impl Engine {
         condition: &ObjectCondition,
     ) -> Result<bool> {
         self.require_bucket(bucket).await?;
-        Ok(self
-            .db
-            .delete_object(bucket, key, condition)
-            .await?
-            .is_some())
+        let deleted = self.db.delete_object(bucket, key, condition).await?;
+        let Some(deleted) = deleted else {
+            return Ok(false);
+        };
+        self.reclaim_blocks(deleted.blocks).await;
+        Ok(true)
     }
 
     pub async fn copy_object(
@@ -102,11 +116,12 @@ impl Engine {
     ) -> Result<ObjectRecord> {
         self.require_bucket(bucket).await?;
         let source = self.get_object(source_bucket, source_key).await?;
-        Ok(self
+        let (object, released_blocks) = self
             .db
             .copy_object(&source, bucket, key, metadata, condition)
-            .await?
-            .0)
+            .await?;
+        self.reclaim_blocks(released_blocks).await;
+        Ok(object)
     }
 }
 

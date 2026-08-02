@@ -153,11 +153,10 @@ impl TelegramClient {
 }
 
 pub fn is_missing_message(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
     bot_api::is_missing_message(error)
-        || error
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("message not found")
+        || text.contains("message not found")
+        || text.contains("message_id_invalid")
 }
 
 impl From<bot_api::UploadedDocument> for StoredDocument {
@@ -171,5 +170,20 @@ impl From<bot_api::UploadedDocument> for StoredDocument {
             file_size: document.file_size,
             message_date: document.message_date,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_missing_message;
+
+    #[test]
+    fn recognizes_missing_grammers_message_ids() {
+        let error =
+            anyhow::anyhow!("grammers Telegram request failed: RPC error MESSAGE_ID_INVALID");
+        assert!(is_missing_message(&error));
+        assert!(!is_missing_message(&anyhow::anyhow!(
+            "grammers Telegram request failed: RPC error MESSAGE_DELETE_FORBIDDEN"
+        )));
     }
 }

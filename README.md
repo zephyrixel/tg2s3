@@ -244,7 +244,9 @@ separate SQLite file and is not part of SQLx migrations.
 
 ## Telegram cleanup caveat
 
-S3 metadata is removed immediately on delete or overwrite. Telegram message
-cleanup runs through the background or `gc` queue. Bot API message deletion is
-limited by Telegram's message age rules; old messages are marked orphaned
-instead of blocking S3 operations.
+S3 metadata is removed immediately on delete or overwrite. Released Telegram
+messages are deleted immediately on a best-effort basis, with the background
+`gc` queue retrying transient failures. Bot API message deletion is limited by
+Telegram's message age rules; old messages are marked orphaned instead of
+blocking S3 operations. Grammers messages are not subject to that Bot API
+48-hour restriction.

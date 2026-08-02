@@ -424,3 +424,170 @@ async fn queued_stale_block_cannot_be_reused_for_commit() -> Result<()> {
     assert_eq!(db.gc_candidates(now(), 10).await?.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn commit_rejects_a_stale_part_snapshot() -> Result<()> {
+    let dir = tempdir()?;
+    let db = Db::open(&dir.path().join("test.sqlite3")).await?;
+    db.create_bucket("bucket").await?;
+    let upload = UploadRecord {
+        upload_id: "snapshot-upload".to_string(),
+        bucket: "bucket".to_string(),
+        key: "object".to_string(),
+        metadata: ObjectMetadata::default(),
+        kind: "put".to_string(),
+        created_at: now(),
+    };
+    db.create_upload(&upload).await?;
+
+    let first = block(1, 3);
+    let first_id = db.add_staged_block(&first).await?;
+    let first = BlockRef {
+        id: first_id,
+        ..first
+    };
+    db.replace_part(&upload.upload_id, 0, 3, "first", &[first])
+        .await?;
+    let snapshot = db.get_parts(&upload.upload_id, true).await?;
+
+    let second = block(2, 3);
+    let second_id = db.add_staged_block(&second).await?;
+    let second = BlockRef {
+        id: second_id,
+        ..second
+    };
+    db.replace_part(&upload.upload_id, 0, 3, "second", &[second])
+        .await?;
+
+    assert!(
+        db.commit_upload(
+            &upload.upload_id,
+            3,
+            "object-etag",
+            &snapshot,
+            &ObjectCondition::default(),
+        )
+        .await
+        .is_err()
+    );
+    let current = db.get_parts(&upload.upload_id, true).await?;
+    assert_eq!(current[0].etag, "second");
+    assert_eq!(current[0].blocks[0].id, second_id);
+    assert!(db.get_upload(&upload.upload_id).await?.is_some());
+    assert_eq!(db.gc_candidates(now(), 10).await?.len(), 1);
+    assert_eq!(db.gc_candidates(now(), 10).await?[0].block_id, first_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacing_a_part_with_the_same_block_preserves_its_reference() -> Result<()> {
+    let dir = tempdir()?;
+    let db = Db::open(&dir.path().join("test.sqlite3")).await?;
+    db.create_bucket("bucket").await?;
+    let upload = UploadRecord {
+        upload_id: "same-block-upload".to_string(),
+        bucket: "bucket".to_string(),
+        key: "object".to_string(),
+        metadata: ObjectMetadata::default(),
+        kind: "put".to_string(),
+        created_at: now(),
+    };
+    db.create_upload(&upload).await?;
+    let block = block(1, 3);
+    let id = db.add_staged_block(&block).await?;
+    let block = BlockRef { id, ..block };
+    db.replace_part(
+        &upload.upload_id,
+        0,
+        3,
+        "same",
+        std::slice::from_ref(&block),
+    )
+    .await?;
+    db.replace_part(
+        &upload.upload_id,
+        0,
+        3,
+        "same",
+        std::slice::from_ref(&block),
+    )
+    .await?;
+
+    let ref_count: i64 = sqlx::query_scalar("SELECT ref_count FROM telegram_blocks WHERE id = ?1")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(ref_count, 1);
+    assert!(db.gc_candidates(now(), 10).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn completing_and_aborting_upload_are_serialized() -> Result<()> {
+    let dir = tempdir()?;
+    let db = Db::open(&dir.path().join("test.sqlite3")).await?;
+    db.create_bucket("bucket").await?;
+    let upload = UploadRecord {
+        upload_id: "racing-upload".to_string(),
+        bucket: "bucket".to_string(),
+        key: "object".to_string(),
+        metadata: ObjectMetadata::default(),
+        kind: "put".to_string(),
+        created_at: now(),
+    };
+    db.create_upload(&upload).await?;
+    let block = block(1, 3);
+    let block_id = db.add_staged_block(&block).await?;
+    let part = PartRecord {
+        upload_id: upload.upload_id.clone(),
+        part_number: 0,
+        size: 3,
+        etag: "first".to_string(),
+        blocks: vec![BlockRef {
+            id: block_id,
+            ..block
+        }],
+    };
+    db.replace_part(&upload.upload_id, 0, 3, &part.etag, &part.blocks)
+        .await?;
+
+    let commit_db = db.clone();
+    let abort_db = db.clone();
+    let upload_id = upload.upload_id.clone();
+    let part_for_commit = part.clone();
+    let (commit, abort) = tokio::join!(
+        async move {
+            commit_db
+                .commit_upload(
+                    &upload_id,
+                    3,
+                    "object-etag",
+                    &[part_for_commit],
+                    &ObjectCondition::default(),
+                )
+                .await
+        },
+        async move { abort_db.abort_upload_with_blocks("racing-upload").await }
+    );
+    let commit = commit?;
+    let abort = abort?;
+    match (commit, abort) {
+        (Some((object, _)), None) => {
+            assert_eq!(object.key, "object");
+            let ref_count: i64 =
+                sqlx::query_scalar("SELECT ref_count FROM telegram_blocks WHERE id = ?1")
+                    .bind(block_id)
+                    .fetch_one(db.pool())
+                    .await?;
+            assert_eq!(ref_count, 1);
+            assert!(db.gc_candidates(now(), 10).await?.is_empty());
+        }
+        (None, Some(blocks)) => {
+            assert_eq!(blocks.len(), 1);
+            assert!(db.get_object("bucket", "object").await?.is_none());
+            assert_eq!(db.gc_candidates(now(), 10).await?.len(), 1);
+        }
+        _ => anyhow::bail!("complete and abort did not serialize to one winner"),
+    }
+    Ok(())
+}

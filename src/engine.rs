@@ -5,7 +5,7 @@ use crate::telegram::TelegramClient;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 mod download;
 mod gc;
@@ -26,6 +26,7 @@ pub struct Engine {
     pub limits: Arc<TransferLimits>,
     upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
+    gc_lock: Arc<Mutex<()>>,
 }
 
 impl Engine {
@@ -40,6 +41,7 @@ impl Engine {
             limits,
             upload_slots: slots,
             download_slots,
+            gc_lock: Arc::new(Mutex::new(())),
         }
     }
 
