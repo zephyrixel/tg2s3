@@ -1,10 +1,11 @@
 use crate::model::{
-    BlockRef, BucketRecord, CorsConfiguration, GarbageRecord, ListingRecord, ObjectMetadata,
-    ObjectRecord, PartRecord, UploadRecord,
+    BlockRef, BucketRecord, CorsConfiguration, GarbageRecord, ListingRecord, ObjectCondition,
+    ObjectMetadata, ObjectRecord, PartRecord, UploadRecord,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -86,24 +87,36 @@ impl Db {
     }
 
     pub async fn delete_bucket(&self, name: &str) -> Result<Option<bool>> {
-        if !self.bucket_exists(name).await? {
+        let mut tx = self.pool.begin().await?;
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM buckets WHERE name = ?1)")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await?;
+        if exists == 0 {
+            tx.rollback().await?;
             return Ok(None);
         }
-        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objects WHERE bucket = ?1")
-            .bind(name)
-            .fetch_one(&self.pool)
-            .await?;
-        if count != 0 {
+        let occupied = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM objects WHERE bucket = ?1)
+             OR EXISTS(SELECT 1 FROM multipart_uploads WHERE bucket = ?1)",
+        )
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if occupied != 0 {
+            tx.rollback().await?;
             return Ok(Some(false));
         }
         sqlx::query("DELETE FROM bucket_cors WHERE bucket = ?1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM buckets WHERE name = ?1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(Some(true))
     }
 
@@ -127,7 +140,7 @@ impl Db {
             key: key.to_string(),
             size: row.get("size"),
             etag: row.get("etag"),
-            metadata: parse_metadata(&row.get::<String, _>("metadata_json")),
+            metadata: parse_metadata(&row.get::<String, _>("metadata_json"))?,
             created_at: row.get("created_at"),
             modified_at: row.get("modified_at"),
             blocks,
@@ -166,10 +179,11 @@ impl Db {
     }
 
     pub async fn create_upload(&self, upload: &UploadRecord) -> Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO multipart_uploads
              (upload_id, bucket, object_key, metadata_json, kind, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE EXISTS(SELECT 1 FROM buckets WHERE name = ?2)",
         )
         .bind(&upload.upload_id)
         .bind(&upload.bucket)
@@ -179,6 +193,9 @@ impl Db {
         .bind(upload.created_at)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() != 1 {
+            bail!("NoSuchBucket");
+        }
         Ok(())
     }
 
@@ -190,7 +207,7 @@ impl Db {
         .bind(upload_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(upload_from_row))
+        row.map(upload_from_row).transpose()
     }
 
     pub async fn list_uploads(&self, bucket: &str, key: Option<&str>) -> Result<Vec<UploadRecord>> {
@@ -212,7 +229,7 @@ impl Db {
             .fetch_all(&self.pool)
             .await?
         };
-        Ok(rows.into_iter().map(upload_from_row).collect())
+        rows.into_iter().map(upload_from_row).collect()
     }
 
     pub async fn add_staged_block(&self, block: &BlockRef) -> Result<i64> {
@@ -325,7 +342,11 @@ impl Db {
         size: i64,
         etag: &str,
         parts: &[PartRecord],
+        condition: &ObjectCondition,
     ) -> Result<Option<(ObjectRecord, Vec<BlockRef>)>> {
+        if validate_parts_layout(parts)? != size {
+            bail!("object storage layout is invalid");
+        }
         let mut tx = self.pool.begin().await?;
         let upload = sqlx::query(
             "SELECT upload_id, bucket, object_key, metadata_json, kind, created_at
@@ -335,6 +356,7 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(upload) = upload else {
+            tx.rollback().await?;
             return Ok(None);
         };
         let bucket: String = upload.get("bucket");
@@ -342,12 +364,16 @@ impl Db {
         let metadata_json: String = upload.get("metadata_json");
         let created_at: i64 = upload.get("created_at");
         let mut old_blocks = Vec::new();
-        let old_id = sqlx::query("SELECT id FROM objects WHERE bucket = ?1 AND object_key = ?2")
+        let old = sqlx::query("SELECT id, etag FROM objects WHERE bucket = ?1 AND object_key = ?2")
             .bind(&bucket)
             .bind(&key)
             .fetch_optional(&mut *tx)
             .await?;
-        if let Some(old_id) = old_id {
+        let old_etag = old.as_ref().map(|row| row.get::<String, _>("etag"));
+        if !condition.allows(old_etag.as_deref()) {
+            bail!("PreconditionFailed");
+        }
+        if let Some(old_id) = old {
             let object_id: i64 = old_id.get("id");
             old_blocks = load_object_blocks_tx(&mut tx, object_id).await?;
             sqlx::query("DELETE FROM objects WHERE id = ?1")
@@ -391,7 +417,16 @@ impl Db {
                 .bind(block.size)
                 .execute(&mut *tx)
                 .await?;
-                sqlx::query("UPDATE telegram_blocks SET state = 'committed' WHERE id = ?1")
+                sqlx::query(
+                    "UPDATE telegram_blocks SET
+                         ref_count = CASE WHEN ref_count < 1 THEN 1 ELSE ref_count END,
+                         state = 'committed'
+                     WHERE id = ?1",
+                )
+                .bind(block.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM gc_queue WHERE block_id = ?1")
                     .bind(block.id)
                     .execute(&mut *tx)
                     .await?;
@@ -419,6 +454,7 @@ impl Db {
             .await?
             .is_some();
         if !exists {
+            tx.rollback().await?;
             return Ok(false);
         }
         let ids = sqlx::query("SELECT block_id FROM multipart_part_blocks WHERE upload_id = ?1")
@@ -436,14 +472,25 @@ impl Db {
         Ok(true)
     }
 
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectRecord>> {
+    pub async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        condition: &ObjectCondition,
+    ) -> Result<Option<ObjectRecord>> {
         let mut tx = self.pool.begin().await?;
-        let object_id = sqlx::query("SELECT id FROM objects WHERE bucket = ?1 AND object_key = ?2")
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(object_id) = object_id else {
+        let object =
+            sqlx::query("SELECT id, etag FROM objects WHERE bucket = ?1 AND object_key = ?2")
+                .bind(bucket)
+                .bind(key)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let object_etag = object.as_ref().map(|row| row.get::<String, _>("etag"));
+        if !condition.allows(object_etag.as_deref()) {
+            bail!("PreconditionFailed");
+        }
+        let Some(object_id) = object else {
+            tx.rollback().await?;
             return Ok(None);
         };
         let object_id: i64 = object_id.get("id");
@@ -475,16 +522,34 @@ impl Db {
         bucket: &str,
         key: &str,
         metadata: &ObjectMetadata,
+        condition: &ObjectCondition,
     ) -> Result<(ObjectRecord, Vec<BlockRef>)> {
         let mut tx = self.pool.begin().await?;
+        let source_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM objects
+                 WHERE id = ?1 AND bucket = ?2 AND object_key = ?3
+             )",
+        )
+        .bind(source.id)
+        .bind(&source.bucket)
+        .bind(&source.key)
+        .fetch_one(&mut *tx)
+        .await?;
+        if source_exists == 0 {
+            bail!("NoSuchKey");
+        }
         let mut old_blocks = Vec::new();
-        if let Some(old_id) =
-            sqlx::query("SELECT id FROM objects WHERE bucket = ?1 AND object_key = ?2")
-                .bind(bucket)
-                .bind(key)
-                .fetch_optional(&mut *tx)
-                .await?
-        {
+        let old = sqlx::query("SELECT id, etag FROM objects WHERE bucket = ?1 AND object_key = ?2")
+            .bind(bucket)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let old_etag = old.as_ref().map(|row| row.get::<String, _>("etag"));
+        if !condition.allows(old_etag.as_deref()) {
+            bail!("PreconditionFailed");
+        }
+        if let Some(old_id) = old {
             let old_id: i64 = old_id.get("id");
             old_blocks = load_object_blocks_tx(&mut tx, old_id).await?;
             sqlx::query("DELETE FROM objects WHERE id = ?1")
@@ -546,6 +611,7 @@ impl Db {
     }
 
     pub async fn gc_candidates(&self, timestamp: i64, limit: usize) -> Result<Vec<GarbageRecord>> {
+        let limit = i64::try_from(limit).context("GC limit exceeds SQLite integer range")?;
         let rows = sqlx::query(
             "SELECT q.block_id, b.chat_id, b.message_id, b.message_date,
                     q.attempts, q.next_attempt, q.last_error
@@ -554,7 +620,7 @@ impl Db {
              ORDER BY q.next_attempt LIMIT ?2",
         )
         .bind(timestamp)
-        .bind(limit as i64)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -701,8 +767,8 @@ impl Db {
     }
 }
 
-fn parse_metadata(value: &str) -> ObjectMetadata {
-    serde_json::from_str(value).unwrap_or_default()
+fn parse_metadata(value: &str) -> Result<ObjectMetadata> {
+    serde_json::from_str(value).context("decode stored metadata")
 }
 
 fn escape_glob(value: &str) -> String {
@@ -719,15 +785,38 @@ fn escape_glob(value: &str) -> String {
     escaped
 }
 
-fn upload_from_row(row: sqlx::sqlite::SqliteRow) -> UploadRecord {
-    UploadRecord {
+fn upload_from_row(row: sqlx::sqlite::SqliteRow) -> Result<UploadRecord> {
+    Ok(UploadRecord {
         upload_id: row.get("upload_id"),
         bucket: row.get("bucket"),
         key: row.get("object_key"),
-        metadata: parse_metadata(&row.get::<String, _>("metadata_json")),
+        metadata: parse_metadata(&row.get::<String, _>("metadata_json"))?,
         kind: row.get("kind"),
         created_at: row.get("created_at"),
+    })
+}
+
+fn validate_parts_layout(parts: &[PartRecord]) -> Result<i64> {
+    let mut total = 0_i64;
+    let mut block_ids = HashSet::new();
+    for part in parts {
+        let mut offset = 0_i64;
+        for block in &part.blocks {
+            if block.size <= 0 || block.offset != offset || !block_ids.insert(block.id) {
+                bail!("object storage layout is invalid");
+            }
+            offset = offset
+                .checked_add(block.size)
+                .ok_or_else(|| anyhow!("object storage layout is invalid"))?;
+        }
+        if offset != part.size {
+            bail!("object storage layout is invalid");
+        }
+        total = total
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("object storage layout is invalid"))?;
     }
+    Ok(total)
 }
 
 async fn load_object_blocks(pool: &SqlitePool, object_id: i64) -> Result<Vec<BlockRef>> {
@@ -838,6 +927,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejects_inconsistent_part_layouts() {
+        let part = PartRecord {
+            upload_id: "upload".to_string(),
+            part_number: 1,
+            size: 4,
+            etag: "etag".to_string(),
+            blocks: vec![block(1, 3)],
+        };
+        assert!(validate_parts_layout(&[part]).is_err());
+    }
+
     #[tokio::test]
     async fn object_commit_copy_delete_and_gc_preserve_references() -> Result<()> {
         let dir = tempdir()?;
@@ -866,24 +967,121 @@ mod tests {
         db.replace_part(&upload.upload_id, 0, 3, &part.etag, &part.blocks)
             .await?;
         let etag = part.etag.clone();
-        db.commit_upload(&upload.upload_id, 3, &etag, &[part])
-            .await?
-            .expect("commit");
+        db.commit_upload(
+            &upload.upload_id,
+            3,
+            &etag,
+            &[part],
+            &ObjectCondition::default(),
+        )
+        .await?
+        .expect("commit");
 
         let source = db
             .get_object("bucket", "one")
             .await?
             .expect("source object");
         assert_eq!(source.blocks.len(), 1);
-        db.copy_object(&source, "bucket", "two", &ObjectMetadata::default())
-            .await?;
-        db.delete_object("bucket", "one")
+
+        let conditional_upload = UploadRecord {
+            upload_id: "conditional-upload".to_string(),
+            bucket: "bucket".to_string(),
+            key: "one".to_string(),
+            metadata: ObjectMetadata::default(),
+            kind: "put".to_string(),
+            created_at: now(),
+        };
+        db.create_upload(&conditional_upload).await?;
+        let replacement = block(2, 3);
+        let replacement_id = db.add_staged_block(&replacement).await?;
+        let replacement = BlockRef {
+            id: replacement_id,
+            ..replacement
+        };
+        let replacement_part = PartRecord {
+            upload_id: conditional_upload.upload_id.clone(),
+            part_number: 0,
+            size: 3,
+            etag: "f561aaf6ef0bf14d4208bb46a22e7d9f".to_string(),
+            blocks: vec![replacement],
+        };
+        db.replace_part(
+            &conditional_upload.upload_id,
+            0,
+            3,
+            &replacement_part.etag,
+            &replacement_part.blocks,
+        )
+        .await?;
+        let stale_condition = ObjectCondition {
+            if_match: Some("\"stale-etag\"".to_string()),
+            if_none_match: None,
+        };
+        assert!(
+            db.commit_upload(
+                &conditional_upload.upload_id,
+                3,
+                "replacement-etag",
+                &[replacement_part],
+                &stale_condition,
+            )
+            .await
+            .is_err()
+        );
+        assert!(db.abort_upload(&conditional_upload.upload_id).await?);
+        let aborted = db.gc_candidates(now(), 10).await?;
+        assert_eq!(aborted.len(), 1);
+        db.gc_success(aborted[0].block_id).await?;
+        assert_eq!(
+            db.get_object("bucket", "one").await?.unwrap().etag,
+            source.etag
+        );
+
+        assert!(
+            db.copy_object(
+                &source,
+                "bucket",
+                "two",
+                &ObjectMetadata::default(),
+                &stale_condition,
+            )
+            .await
+            .is_err()
+        );
+        assert!(db.get_object("bucket", "two").await?.is_none());
+        assert!(
+            db.delete_object("bucket", "one", &stale_condition)
+                .await
+                .is_err()
+        );
+        assert!(db.get_object("bucket", "one").await?.is_some());
+
+        db.copy_object(
+            &source,
+            "bucket",
+            "two",
+            &ObjectMetadata::default(),
+            &ObjectCondition::default(),
+        )
+        .await?;
+        db.delete_object("bucket", "one", &ObjectCondition::default())
             .await?
             .expect("delete source");
         assert!(db.get_object("bucket", "two").await?.is_some());
+        assert!(
+            db.copy_object(
+                &source,
+                "bucket",
+                "stale-copy",
+                &ObjectMetadata::default(),
+                &ObjectCondition::default(),
+            )
+            .await
+            .is_err()
+        );
         assert!(db.gc_candidates(now(), 10).await?.is_empty());
 
-        db.delete_object("bucket", "two")
+        db.delete_object("bucket", "two", &ObjectCondition::default())
             .await?
             .expect("delete copy");
         let garbage = db.gc_candidates(now(), 10).await?;
@@ -941,6 +1139,91 @@ mod tests {
         assert_eq!(object.size, 3);
         assert_eq!(object.etag, "etag");
         assert!(db.get_bucket_cors("legacy").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bucket_delete_rejects_active_uploads() -> Result<()> {
+        let dir = tempdir()?;
+        let db = Db::open(&dir.path().join("test.sqlite3")).await?;
+        db.create_bucket("bucket").await?;
+        db.create_upload(&UploadRecord {
+            upload_id: "multipart-1".to_string(),
+            bucket: "bucket".to_string(),
+            key: "pending".to_string(),
+            metadata: ObjectMetadata::default(),
+            kind: "multipart".to_string(),
+            created_at: now(),
+        })
+        .await?;
+
+        assert_eq!(db.delete_bucket("bucket").await?, Some(false));
+        assert!(db.abort_upload("multipart-1").await?);
+        assert_eq!(db.delete_bucket("bucket").await?, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_creation_requires_an_existing_bucket() -> Result<()> {
+        let dir = tempdir()?;
+        let db = Db::open(&dir.path().join("test.sqlite3")).await?;
+        let upload = UploadRecord {
+            upload_id: "missing-bucket-upload".to_string(),
+            bucket: "missing".to_string(),
+            key: "object".to_string(),
+            metadata: ObjectMetadata::default(),
+            kind: "put".to_string(),
+            created_at: now(),
+        };
+        assert!(db.create_upload(&upload).await.is_err());
+        assert!(db.get_upload(&upload.upload_id).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committing_a_stale_block_restores_its_reference() -> Result<()> {
+        let dir = tempdir()?;
+        let db = Db::open(&dir.path().join("test.sqlite3")).await?;
+        db.create_bucket("bucket").await?;
+        let upload = UploadRecord {
+            upload_id: "upload-stale".to_string(),
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            metadata: ObjectMetadata::default(),
+            kind: "put".to_string(),
+            created_at: now(),
+        };
+        db.create_upload(&upload).await?;
+        let staged = block(1, 3);
+        let id = db.add_staged_block(&staged).await?;
+        let staged = BlockRef { id, ..staged };
+        db.delete_stale_block(id).await?;
+        let part = PartRecord {
+            upload_id: upload.upload_id.clone(),
+            part_number: 0,
+            size: 3,
+            etag: "900150983cd24fb0d6963f7d28e17f72".to_string(),
+            blocks: vec![staged],
+        };
+        db.replace_part(&upload.upload_id, 0, 3, &part.etag, &part.blocks)
+            .await?;
+        let etag = part.etag.clone();
+        db.commit_upload(
+            &upload.upload_id,
+            3,
+            &etag,
+            &[part],
+            &ObjectCondition::default(),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("upload disappeared"))?;
+
+        let refs: i64 = sqlx::query_scalar("SELECT ref_count FROM telegram_blocks WHERE id = ?1")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await?;
+        assert_eq!(refs, 1);
+        assert!(db.gc_candidates(now(), 10).await?.is_empty());
         Ok(())
     }
 }

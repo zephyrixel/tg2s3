@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow, bail};
-use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, Method, Uri};
 use sha2::{Digest, Sha256};
@@ -54,6 +53,9 @@ impl SigV4 {
                     .find(|(key, _)| key.eq_ignore_ascii_case(name))
                     .map(|(_, value)| value.clone())
             };
+            if value("X-Amz-Algorithm").as_deref() != Some("AWS4-HMAC-SHA256") {
+                bail!("AccessDenied");
+            }
             let credential = value("X-Amz-Credential").ok_or_else(|| anyhow!("AccessDenied"))?;
             let signed_headers =
                 value("X-Amz-SignedHeaders").ok_or_else(|| anyhow!("AccessDenied"))?;
@@ -121,7 +123,12 @@ impl SigV4 {
             bail!("AccessDenied");
         }
         let date = credential_parts[1];
-        if !amz_date.starts_with(date) {
+        if date.len() != 8
+            || !date.bytes().all(|byte| byte.is_ascii_digit())
+            || !amz_date.is_ascii()
+            || amz_date.len() != 16
+            || !amz_date.starts_with(date)
+        {
             bail!("AccessDenied");
         }
         let request_time = parse_amz_date(&amz_date)?;
@@ -261,11 +268,6 @@ fn hmac_bytes(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key"))?;
     mac.update(data);
     Ok(mac.finalize().into_bytes().to_vec())
-}
-
-#[allow(dead_code)]
-fn decode_base64(value: &str) -> Result<Vec<u8>> {
-    Ok(base64::engine::general_purpose::STANDARD.decode(value)?)
 }
 
 #[cfg(test)]
@@ -446,7 +448,16 @@ mod tests {
     #[test]
     fn verifies_s3_presigned_get_with_unsigned_payload() -> Result<()> {
         let method = Method::GET;
-        let uri: Uri = "/A/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20260801%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260801T162829Z&X-Amz-Expires=3599&X-Amz-SignedHeaders=host&X-Amz-Signature=placeholder".parse()?;
+        let format =
+            time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
+        let amz_date = OffsetDateTime::now_utc().format(format)?;
+        let date = &amz_date[..8];
+        let credential = format!("AKIDEXAMPLE/{date}/us-east-1/s3/aws4_request");
+        let uri: Uri = format!(
+            "/A/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires=3599&X-Amz-SignedHeaders=host&X-Amz-Signature=placeholder",
+            aws_encode(&credential),
+        )
+        .parse()?;
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("localhost:9000"));
         let verifier = SigV4 {
@@ -468,13 +479,12 @@ mod tests {
             "host",
             "UNSIGNED-PAYLOAD",
         );
-        let amz_date = "20260801T162829Z";
-        let scope = "20260801/us-east-1/s3/aws4_request";
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
             hex::encode(Sha256::digest(canonical_request.as_bytes()))
         );
-        let key = signing_key("secret", "20260801", "us-east-1", "s3")?;
+        let key = signing_key("secret", date, "us-east-1", "s3")?;
         let signature = hex::encode(hmac_bytes(&key, string_to_sign.as_bytes())?);
         let uri = uri.to_string().replace("placeholder", &signature).parse()?;
         verifier.verify(&method, &uri, &headers)?;

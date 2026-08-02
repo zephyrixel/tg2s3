@@ -26,6 +26,73 @@ migrations, checks SQLite integrity, verifies Telegram permissions, creates
 the buckets in `TG2S3_INIT_BUCKETS`, and starts the S3 endpoint. No AWS CLI,
 rclone, Cloudreve, or `sqlx-cli` is required at runtime.
 
+### Local Telegram Bot API with Compose
+
+The optional `compose.local-bot-api.yaml` overlay builds the Bot API server
+from the upstream Telegram source and runs it only on the Compose network. It
+mounts the Bot API working directory at the same absolute path in both
+containers because local `getFile` responses contain absolute file paths.
+
+Set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` in `.env`, log the bot out from
+the public Bot API once, then start the overlay:
+
+```sh
+docker compose -f compose.yaml -f compose.local-bot-api.yaml up -d --build
+docker compose -f compose.yaml -f compose.local-bot-api.yaml logs -f telegram-bot-api tg2s3
+```
+
+The overlay sets `TG2S3_LOCAL_BOT_API=true` and uses
+`http://telegram-bot-api:8081`. Port 8081 is intentionally not published to
+the host or Cloudflare. Its health check calls `getMe`, so tg2s3 waits for the
+Bot API server to accept authenticated requests. `TELEGRAM_BOT_API_REF` pins
+the upstream source ref; update it deliberately and rebuild the image when
+upgrading.
+
+The `telegram-bot-api-data` volume is a separate disk budget from
+`tg2s3-data`. Local `getFile` may prepare complete files there, so size it for
+the largest concurrent downloads plus the files retained by the Bot API; the
+tg2s3 garbage collector does not prune this volume.
+
+#### Local Bot API disk sizing
+
+In local mode, `getFile` asks the Bot API server to download the complete
+Telegram document and returns an absolute local path. tg2s3 then reads only
+the requested range from that path. A Cloudreve range request can therefore
+consume one complete tg2s3 block on the Bot API volume even when the client
+requested only a few bytes.
+
+Let `C` be `TG2S3_CHUNK_SIZE`, `D` be
+`TG2S3_DOWNLOAD_CONCURRENCY`, and `U` be `TG2S3_UPLOAD_CONCURRENCY`:
+
+```text
+transient working set ~= C * (D + U)
+recommended volume ~= (unique block bytes likely retained locally
+                       + transient working set) * 1.25
+```
+
+The first term is the important one. It is not bounded by `C` or by the
+concurrency settings, because tg2s3 does not control Bot API/TDLib file
+eviction. For the default `16 MiB`, `D=4`, and `U=4`, reserve about `128 MiB`
+for transient transfers, then add the unique data expected to be read through
+the local Bot API. For example, fully reading a 4 GiB object normally makes
+roughly 4 GiB of its blocks eligible for the local working directory, so a
+5-6 GiB volume is a practical minimum for that workload. If 100 GiB of unique
+objects may be read and retained, plan for at least 125 GiB and monitor the
+volume. Keep additional free space for SQLite/TDLib metadata and filesystem
+overhead.
+
+Check the current usage with:
+
+```sh
+docker compose -f compose.yaml -f compose.local-bot-api.yaml \
+  exec telegram-bot-api du -sh /var/lib/telegram-bot-api
+```
+
+Do not remove files from this volume while the Bot API server is running. To
+reclaim all local copies, stop the stack and remove/recreate only the
+`telegram-bot-api-data` volume after accepting that subsequent reads will
+download the blocks again.
+
 For a local Rust run:
 
 ```sh

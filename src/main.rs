@@ -81,8 +81,17 @@ async fn serve(config: Config) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(gc_interval));
         loop {
             interval.tick().await;
-            if let Err(error) = gc_engine.run_gc(gc_limit).await {
-                tracing::error!(%error, "background Telegram garbage collection failed");
+            match gc_engine.run_gc(gc_limit).await {
+                Ok(processed) if processed > 0 => {
+                    tracing::info!(
+                        processed,
+                        "background Telegram garbage collection completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "background Telegram garbage collection failed");
+                }
             }
         }
     });

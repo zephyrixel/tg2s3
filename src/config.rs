@@ -4,6 +4,11 @@ use clap::Args;
 use std::{net::SocketAddr, path::PathBuf};
 use url::Url;
 
+const MAX_TELEGRAM_CONCURRENCY: usize = 1024;
+const MAX_TELEGRAM_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+const MAX_GC_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
+pub const MAX_GC_LIMIT: usize = 100_000;
+
 #[derive(Clone, Debug, Args)]
 pub struct ConfigArgs {
     #[arg(long, env = "TG2S3_DATA_DIR", default_value = "./data")]
@@ -39,6 +44,9 @@ pub struct ConfigArgs {
 
     #[arg(long, env = "TG2S3_DOWNLOAD_CONCURRENCY", default_value_t = 4)]
     pub download_concurrency: usize,
+
+    #[arg(long, env = "TG2S3_TELEGRAM_TIMEOUT_SECS", default_value_t = 300)]
+    pub telegram_timeout_secs: u64,
 
     #[arg(long, env = "TG2S3_ACCESS_KEY")]
     pub access_key: Option<String>,
@@ -96,6 +104,7 @@ pub struct Config {
     pub chunk_size: usize,
     pub upload_concurrency: usize,
     pub download_concurrency: usize,
+    pub telegram_timeout_secs: u64,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
     pub allow_anonymous: bool,
@@ -116,16 +125,36 @@ impl ConfigArgs {
         if self.chunk_size == 0 || self.chunk_size > 2_000_000_000 {
             bail!("chunk size must be between 1 and 2,000,000,000 bytes");
         }
+        let region = self.region.trim().to_string();
+        if region.is_empty() {
+            bail!("TG2S3_REGION must not be empty");
+        }
         if !self.local_bot_api && self.chunk_size > 20 * 1024 * 1024 {
             bail!(
                 "public Bot API mode requires chunk size <= 20 MiB; enable TG2S3_LOCAL_BOT_API for larger chunks"
             );
         }
-        if self.upload_concurrency == 0 || self.download_concurrency == 0 {
-            bail!("concurrency must be greater than zero");
+        if self.upload_concurrency == 0
+            || self.download_concurrency == 0
+            || self.upload_concurrency > MAX_TELEGRAM_CONCURRENCY
+            || self.download_concurrency > MAX_TELEGRAM_CONCURRENCY
+        {
+            bail!(
+                "upload and download concurrency must be between 1 and {MAX_TELEGRAM_CONCURRENCY}"
+            );
         }
-        if self.gc_interval == 0 || self.gc_limit == 0 {
-            bail!("GC interval and limit must be greater than zero");
+        if self.telegram_timeout_secs == 0 || self.telegram_timeout_secs > MAX_TELEGRAM_TIMEOUT_SECS
+        {
+            bail!("TG2S3_TELEGRAM_TIMEOUT_SECS must be between 1 and {MAX_TELEGRAM_TIMEOUT_SECS}");
+        }
+        if self.gc_interval == 0
+            || self.gc_interval > MAX_GC_INTERVAL_SECS
+            || self.gc_limit == 0
+            || self.gc_limit > MAX_GC_LIMIT
+        {
+            bail!(
+                "GC interval must be between 1 and {MAX_GC_INTERVAL_SECS} seconds and GC limit between 1 and {MAX_GC_LIMIT}"
+            );
         }
         let bot_token = self.bot_token.unwrap_or_default();
         let chat_id = self.chat_id.unwrap_or_default();
@@ -136,7 +165,9 @@ impl ConfigArgs {
             bail!("TG2S3_CHAT_ID is required for this command");
         }
         match (&self.access_key, &self.secret_key) {
-            (Some(_), Some(_)) | (None, None) => {}
+            (Some(access_key), Some(secret_key))
+                if !access_key.is_empty() && !secret_key.is_empty() => {}
+            (None, None) => {}
             _ => bail!("TG2S3_ACCESS_KEY and TG2S3_SECRET_KEY must be configured together"),
         }
         if require_auth
@@ -166,6 +197,7 @@ impl ConfigArgs {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create database directory {}", parent.display()))?;
         }
+        let telegram_api_url = normalize_telegram_api_url(&self.telegram_api_url)?;
         let public_host = normalize_public_host(self.public_host)?;
         Ok(Config {
             data_dir: self.data_dir,
@@ -173,15 +205,16 @@ impl ConfigArgs {
             listen: self.listen,
             bot_token,
             chat_id,
-            telegram_api_url: self.telegram_api_url.trim_end_matches('/').to_string(),
+            telegram_api_url,
             local_bot_api: self.local_bot_api,
             chunk_size: self.chunk_size,
             upload_concurrency: self.upload_concurrency,
             download_concurrency: self.download_concurrency,
+            telegram_timeout_secs: self.telegram_timeout_secs,
             access_key: self.access_key,
             secret_key: self.secret_key,
             allow_anonymous: self.allow_anonymous,
-            region: self.region,
+            region,
             public_host,
             init_buckets,
             cors,
@@ -212,6 +245,19 @@ fn normalize_public_host(value: Option<String>) -> Result<Option<String>> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     }))
+}
+
+fn normalize_telegram_api_url(value: &str) -> Result<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let url = Url::parse(trimmed).context("parse TG2S3_TELEGRAM_API_URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("TG2S3_TELEGRAM_API_URL must be an HTTP(S) URL without a query or fragment");
+    }
+    Ok(trimmed.to_string())
 }
 
 pub fn split_list(value: &str) -> Vec<String> {
@@ -271,10 +317,11 @@ mod tests {
             chunk_size: 16 * 1024 * 1024,
             upload_concurrency: 1,
             download_concurrency: 1,
+            telegram_timeout_secs: 300,
             access_key: None,
             secret_key: None,
             allow_anonymous: true,
-            region: "us-east-1".to_string(),
+            region: " us-east-1 ".to_string(),
             public_host: None,
             init_buckets: "A, cloudreve".to_string(),
             cors_allowed_origins: "*".to_string(),
@@ -285,9 +332,27 @@ mod tests {
             gc_interval: 300,
             gc_limit: 100,
         };
-        let config = args.into_config(false, false)?;
+        let config = args.clone().into_config(false, false)?;
         assert_eq!(config.init_buckets, ["A", "cloudreve"]);
         assert_eq!(config.cors.allowed_origins, ["*"]);
+        assert_eq!(config.region, "us-east-1");
+        let mut invalid_region = args.clone();
+        invalid_region.region = " ".to_string();
+        assert!(invalid_region.into_config(false, false).is_err());
+        let mut invalid = args;
+        invalid.telegram_timeout_secs = 0;
+        assert!(invalid.into_config(false, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn validates_telegram_api_base_url() -> Result<()> {
+        assert_eq!(
+            normalize_telegram_api_url("http://telegram-bot-api:8081/")?,
+            "http://telegram-bot-api:8081"
+        );
+        assert!(normalize_telegram_api_url("telegram-bot-api:8081").is_err());
+        assert!(normalize_telegram_api_url("https://api.telegram.org?x=1").is_err());
         Ok(())
     }
 }

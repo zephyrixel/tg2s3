@@ -1,0 +1,47 @@
+services:
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: docker/telegram-bot-api.Dockerfile
+      args:
+        TELEGRAM_BOT_API_REF: ${TELEGRAM_BOT_API_REF:-adfd7f6a8e990272851777eeb3ae0def4216f161}
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID in .env}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH in .env}
+      TG2S3_BOT_TOKEN: ${TG2S3_BOT_TOKEN:?set TG2S3_BOT_TOKEN in .env}
+    command:
+      - --local
+      - --http-ip-address=0.0.0.0
+      - --http-port=8081
+      - --dir=/var/lib/telegram-bot-api
+    expose:
+      - "8081"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O /dev/null
+          http://127.0.0.1:8081/bot$${TG2S3_BOT_TOKEN}/getMe
+          || exit 1
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+
+  tg2s3:
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+    environment:
+      TG2S3_LOCAL_BOT_API: "true"
+      TG2S3_TELEGRAM_API_URL: http://telegram-bot-api:8081
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+    group_add:
+      - "101"
+
+volumes:
+  telegram-bot-api-data:

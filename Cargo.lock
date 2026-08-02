@@ -2004,7 +2004,6 @@ dependencies = [
  "sqlx",
  "subtle",
  "tempfile",
- "thiserror",
  "time",
  "tokio",
  "tracing",

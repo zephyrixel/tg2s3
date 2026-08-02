@@ -54,6 +54,32 @@ struct TelegramFailure {
     retry_after: Option<Duration>,
 }
 
+fn retry_policy(error: &anyhow::Error, idempotent: bool) -> (bool, Option<Duration>) {
+    if let Some(failure) = error.downcast_ref::<TelegramFailure>() {
+        return (
+            failure.status == StatusCode::TOO_MANY_REQUESTS
+                || (idempotent
+                    && (failure.status == StatusCode::REQUEST_TIMEOUT
+                        || failure.status.is_server_error())),
+            failure.retry_after,
+        );
+    }
+    (
+        idempotent && error.downcast_ref::<reqwest::Error>().is_some(),
+        None,
+    )
+}
+
+pub fn is_missing_message(error: &anyhow::Error) -> bool {
+    let Some(failure) = error.downcast_ref::<TelegramFailure>() else {
+        return false;
+    };
+    let description = failure.description.to_ascii_lowercase();
+    failure.status == StatusCode::BAD_REQUEST
+        && description.contains("message")
+        && description.contains("not found")
+}
+
 impl std::fmt::Display for TelegramFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Telegram {}: {}", self.status, self.description)
@@ -106,6 +132,7 @@ impl TelegramClient {
                 (config.upload_concurrency + config.download_concurrency).max(8),
             )
             .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(config.telegram_timeout_secs))
             .build()?;
         Ok(Self {
             token: config.bot_token.clone(),
@@ -138,17 +165,17 @@ impl TelegramClient {
         if member.status != "administrator" && member.status != "creator" {
             return Err(anyhow!("bot must be an administrator of the storage chat"));
         }
-        if chat.kind == "channel" && member.can_post_messages != Some(true) {
+        if chat.kind == "channel" && !has_admin_permission(&member, member.can_post_messages) {
             return Err(anyhow!(
                 "bot needs can_post_messages in the storage channel"
             ));
         }
-        if chat.kind == "supergroup" && member.can_delete_messages != Some(true) {
+        if chat.kind == "supergroup" && !has_admin_permission(&member, member.can_delete_messages) {
             return Err(anyhow!(
                 "bot needs can_delete_messages in the storage supergroup"
             ));
         }
-        if member.can_delete_messages != Some(true) {
+        if !has_admin_permission(&member, member.can_delete_messages) {
             return Err(anyhow!(
                 "bot needs can_delete_messages for garbage collection"
             ));
@@ -174,9 +201,12 @@ impl TelegramClient {
 
     pub async fn upload_chunk(&self, data: Bytes, filename: &str) -> Result<UploadedDocument> {
         let api_url = self.method_url("sendDocument");
-        self.retry("sendDocument", || async {
-            let document =
-                reqwest::multipart::Part::bytes(data.to_vec()).file_name(filename.to_string());
+        self.retry("sendDocument", false, || async {
+            let document = reqwest::multipart::Part::stream_with_length(
+                reqwest::Body::from(data.clone()),
+                data.len() as u64,
+            )
+            .file_name(filename.to_string());
             let form = reqwest::multipart::Form::new()
                 .text("chat_id", self.chat_id.to_string())
                 .text("disable_notification", "true")
@@ -207,7 +237,12 @@ impl TelegramClient {
         let path = info
             .file_path
             .ok_or_else(|| anyhow!("Telegram getFile returned no file_path"))?;
-        let expected = (end - start + 1) as usize;
+        let expected = usize::try_from(
+            end.checked_sub(start)
+                .and_then(|length| length.checked_add(1))
+                .ok_or_else(|| anyhow!("Telegram range is too large"))?,
+        )
+        .map_err(|_| anyhow!("Telegram range does not fit in memory"))?;
         if self.local_bot_api && Path::new(&path).is_absolute() {
             let mut file = tokio::fs::File::open(&path).await?;
             file.seek(std::io::SeekFrom::Start(start as u64)).await?;
@@ -221,7 +256,7 @@ impl TelegramClient {
             self.token,
             path.trim_start_matches('/')
         );
-        self.retry("file download", || async {
+        self.retry("file download", true, || async {
             let response = self
                 .client
                 .get(&url)
@@ -275,7 +310,7 @@ impl TelegramClient {
         params: &[(&str, String)],
     ) -> Result<T> {
         let url = self.method_url(method);
-        self.retry(method, || async {
+        self.retry(method, true, || async {
             let mut request = self.client.get(&url);
             let query: Vec<(&str, &str)> = params
                 .iter()
@@ -294,7 +329,7 @@ impl TelegramClient {
         params: &[(&str, String)],
     ) -> Result<T> {
         let url = self.method_url(method);
-        self.retry(method, || async {
+        self.retry(method, true, || async {
             let mut form: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
             for (key, value) in params {
                 form.insert(*key, value.as_str());
@@ -312,9 +347,18 @@ impl TelegramClient {
     ) -> Result<T> {
         let status = response.status();
         let body = response.bytes().await?;
-        let envelope: ApiEnvelope<T> = serde_json::from_slice(&body)
-            .map_err(|error| anyhow!("Telegram {method} invalid response: {error}"))?;
-        if !envelope.ok {
+        let envelope: ApiEnvelope<T> = match serde_json::from_slice(&body) {
+            Ok(envelope) => envelope,
+            Err(error) if !status.is_success() => {
+                return Err(anyhow!(TelegramFailure {
+                    status,
+                    description: format!("invalid Telegram error response: {error}"),
+                    retry_after: None,
+                }));
+            }
+            Err(error) => return Err(anyhow!("Telegram {method} invalid response: {error}")),
+        };
+        if !status.is_success() || !envelope.ok {
             let failure = TelegramFailure {
                 status,
                 description: envelope
@@ -332,7 +376,7 @@ impl TelegramClient {
             .ok_or_else(|| anyhow!("Telegram {method} returned no result"))
     }
 
-    async fn retry<T, F, Fut>(&self, method: &str, mut operation: F) -> Result<T>
+    async fn retry<T, F, Fut>(&self, method: &str, idempotent: bool, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -343,22 +387,13 @@ impl TelegramClient {
             match operation().await {
                 Ok(value) => return Ok(value),
                 Err(error) => {
-                    let retry_after = error
-                        .downcast_ref::<TelegramFailure>()
-                        .and_then(|failure| failure.retry_after);
-                    let retryable_status = error
-                        .downcast_ref::<TelegramFailure>()
-                        .map(|failure| {
-                            failure.status == StatusCode::TOO_MANY_REQUESTS
-                                || failure.status.is_server_error()
-                        })
-                        .unwrap_or(false);
-                    if !retryable_status
-                        && error
-                            .downcast_ref::<reqwest::Error>()
-                            .map(|e| !e.is_timeout() && !e.is_connect())
-                            .unwrap_or(false)
-                    {
+                    let (retryable, retry_after) = retry_policy(&error, idempotent);
+                    let error = if error.downcast_ref::<reqwest::Error>().is_some() {
+                        anyhow!("Telegram {method} request transport error")
+                    } else {
+                        error
+                    };
+                    if !retryable {
                         return Err(error);
                     }
                     if attempt == 4 {
@@ -380,6 +415,10 @@ impl TelegramClient {
     }
 }
 
+fn has_admin_permission(member: &ChatMember, permission: Option<bool>) -> bool {
+    member.status == "creator" || permission == Some(true)
+}
+
 impl From<UploadedDocument> for BlockRef {
     fn from(document: UploadedDocument) -> Self {
         Self {
@@ -393,5 +432,102 @@ impl From<UploadedDocument> for BlockRef {
             file_unique_id: document.file_unique_id,
             message_date: document.message_date,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(status: StatusCode) -> anyhow::Error {
+        anyhow::Error::new(TelegramFailure {
+            status,
+            description: "test".to_string(),
+            retry_after: Some(Duration::from_secs(3)),
+        })
+    }
+
+    #[test]
+    fn retries_only_transient_telegram_failures() {
+        assert_eq!(
+            retry_policy(&failure(StatusCode::BAD_REQUEST), true),
+            (false, Some(Duration::from_secs(3)))
+        );
+        assert_eq!(
+            retry_policy(&failure(StatusCode::TOO_MANY_REQUESTS), false),
+            (true, Some(Duration::from_secs(3)))
+        );
+        assert_eq!(
+            retry_policy(&failure(StatusCode::INTERNAL_SERVER_ERROR), true),
+            (true, Some(Duration::from_secs(3)))
+        );
+        assert_eq!(
+            retry_policy(&failure(StatusCode::INTERNAL_SERVER_ERROR), false),
+            (false, Some(Duration::from_secs(3)))
+        );
+    }
+
+    #[test]
+    fn creator_has_implicit_storage_permissions() {
+        let creator = ChatMember {
+            status: "creator".to_string(),
+            can_post_messages: None,
+            can_delete_messages: None,
+        };
+        assert!(has_admin_permission(&creator, None));
+
+        let administrator = ChatMember {
+            status: "administrator".to_string(),
+            can_post_messages: None,
+            can_delete_messages: None,
+        };
+        assert!(!has_admin_permission(&administrator, None));
+        assert!(has_admin_permission(&administrator, Some(true)));
+    }
+
+    #[test]
+    fn recognizes_already_deleted_messages() {
+        let error = anyhow::Error::new(TelegramFailure {
+            status: StatusCode::BAD_REQUEST,
+            description: "Bad Request: message to delete not found".to_string(),
+            retry_after: None,
+        });
+        assert!(is_missing_message(&error));
+        assert!(!is_missing_message(&failure(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn classifies_non_json_server_errors_as_retryable() -> Result<()> {
+        use axum::response::IntoResponse;
+
+        async fn gateway_error() -> impl IntoResponse {
+            (StatusCode::BAD_GATEWAY, "upstream gateway error")
+        }
+
+        let app = axum::Router::new().route("/", axum::routing::get(gateway_error));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = TelegramClient {
+            token: String::new(),
+            chat_id: 0,
+            api_url: String::new(),
+            local_bot_api: false,
+            client: reqwest::Client::new(),
+        };
+        let response = client
+            .client
+            .get(format!("http://{address}/"))
+            .send()
+            .await?;
+        let error = client
+            .decode::<serde_json::Value>(response, "test")
+            .await
+            .expect_err("gateway error should fail");
+        assert!(retry_policy(&error, true).0);
+        assert!(!retry_policy(&error, false).0);
+        Ok(())
     }
 }

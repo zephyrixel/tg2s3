@@ -9,6 +9,10 @@ pub async fn prepare(config: Config, verify_telegram: bool) -> Result<Engine> {
         data_dir = %config.data_dir.display(),
         database = %config.db_path.display(),
         buckets = ?config.init_buckets,
+        local_bot_api = config.local_bot_api,
+        chunk_size = config.chunk_size,
+        upload_concurrency = config.upload_concurrency,
+        download_concurrency = config.download_concurrency,
         "configuration validated"
     );
     let db = Db::open(&config.db_path).await?;

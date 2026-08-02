@@ -1,6 +1,8 @@
 use crate::auth::SigV4;
 use crate::engine::Engine;
-use crate::model::{CorsConfiguration, ObjectMetadata, ObjectRecord};
+use crate::model::{
+    CorsConfiguration, ObjectCondition, ObjectMetadata, ObjectRecord, normalize_etag,
+};
 use anyhow::{Result, anyhow, bail};
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
@@ -148,16 +150,16 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
         Err(error) => {
             let status = status_for(&error);
             let code = error_code(&error);
-            tracing::error!(
-                request_id = %request_id,
-                method = %request_method,
-                path = %request_uri.path(),
-                status = %status,
-                code = %code,
-                error = %error,
-                "S3 request failed"
+            let message = public_error_message(&code, &error);
+            log_request_failure(
+                &request_id,
+                &request_method,
+                request_uri.path(),
+                status,
+                &code,
+                &error,
             );
-            error_response(status, code, &error.to_string(), &request_uri, &request_id)
+            error_response(status, code, &message, &request_uri, &request_id)
         }
     };
     tracing::info!(
@@ -226,7 +228,11 @@ async fn dispatch_bucket(
     if query_has(query, "location") {
         return if method == Method::GET {
             xml_response(BucketLocation {
-                location: String::new(),
+                location: if state.engine.config.region == "us-east-1" {
+                    String::new()
+                } else {
+                    state.engine.config.region.clone()
+                },
             })
         } else {
             Err(anyhow!("MethodNotAllowed"))
@@ -334,10 +340,12 @@ async fn dispatch_object(
             .get("x-amz-copy-source")
             .and_then(|value| value.to_str().ok())
         {
-            check_write_conditions(state.engine.db.get_object(bucket, key).await?, headers)?;
-            return copy_object(state, bucket, key, source, headers).await;
+            let condition = object_condition(headers);
+            check_write_conditions(state.engine.db.get_object(bucket, key).await?, &condition)?;
+            return copy_object(state, bucket, key, source, headers, &condition).await;
         }
-        check_write_conditions(state.engine.db.get_object(bucket, key).await?, headers)?;
+        let condition = object_condition(headers);
+        check_write_conditions(state.engine.db.get_object(bucket, key).await?, &condition)?;
         let metadata = metadata_from_headers(headers);
         let length = headers
             .get(header::CONTENT_LENGTH)
@@ -345,7 +353,7 @@ async fn dispatch_object(
             .and_then(|value| value.parse::<i64>().ok());
         let object = state
             .engine
-            .put_object(bucket, key, body, metadata, length)
+            .put_object(bucket, key, body, metadata, length, condition)
             .await?;
         let mut response = empty_response(StatusCode::OK);
         response
@@ -369,8 +377,9 @@ async fn dispatch_object(
     } else if method == Method::GET || method == Method::HEAD {
         get_object(&state.engine, bucket, key, headers, method == Method::HEAD).await
     } else if method == Method::DELETE {
-        check_write_conditions(state.engine.db.get_object(bucket, key).await?, headers)?;
-        let _ = state.engine.delete_object(bucket, key).await?;
+        let condition = object_condition(headers);
+        check_write_conditions(state.engine.db.get_object(bucket, key).await?, &condition)?;
+        let _ = state.engine.delete_object(bucket, key, &condition).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     } else {
         Err(anyhow!("MethodNotAllowed"))
@@ -529,15 +538,25 @@ async fn list_objects(
     }
     let prefix = query_value(query, "prefix").unwrap_or_default();
     let delimiter = query_value(query, "delimiter").unwrap_or_default();
-    let max_keys = query_value(query, "max-keys")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1000)
-        .min(1000);
+    let max_keys = match query_value(query, "max-keys") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| anyhow!("InvalidArgument"))?
+            .min(1000),
+        None => 1000,
+    };
     let is_v2 = query_value(query, "list-type").as_deref() == Some("2");
-    let mut after = query_value(query, "start-after")
-        .or_else(|| query_value(query, "marker"))
-        .unwrap_or_default();
-    if let Some(token) = query_value(query, "continuation-token") {
+    let start_after = if is_v2 {
+        query_value(query, "start-after")
+    } else {
+        None
+    };
+    let mut after = if is_v2 {
+        start_after.clone().unwrap_or_default()
+    } else {
+        query_value(query, "marker").unwrap_or_default()
+    };
+    if is_v2 && let Some(token) = query_value(query, "continuation-token") {
         after = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(token)
@@ -545,41 +564,77 @@ async fn list_objects(
         )
         .map_err(|_| anyhow!("InvalidArgument"))?;
     }
-    let entries = engine
-        .db
-        .list_objects(bucket, &prefix, &after, max_keys + 1)
-        .await?;
-    let truncated = entries.len() > max_keys;
-    let shown = entries.into_iter().take(max_keys).collect::<Vec<_>>();
     let mut contents = Vec::new();
     let mut common_prefixes = Vec::new();
     let mut seen = HashSet::new();
-    for entry in &shown {
-        if !delimiter.is_empty() {
-            let rest = entry.key.strip_prefix(&prefix).unwrap_or(&entry.key);
-            if let Some(index) = rest.find(&delimiter) {
-                let common = format!("{}{}", prefix, &rest[..index + delimiter.len()]);
-                if seen.insert(common.clone()) {
-                    common_prefixes.push(CommonPrefix { prefix: common });
+    let mut truncated = false;
+    let mut next_cursor = None;
+    let mut limit_prefix: Option<String> = None;
+    const SCAN_BATCH_SIZE: usize = 1000;
+
+    if max_keys > 0 {
+        'scan: loop {
+            let entries = engine
+                .db
+                .list_objects(bucket, &prefix, &after, SCAN_BATCH_SIZE)
+                .await?;
+            let page_len = entries.len();
+            if page_len == 0 {
+                break;
+            }
+            for entry in entries {
+                let entry_prefix = common_prefix(&entry.key, &prefix, &delimiter);
+                if let Some(limit_prefix) = &limit_prefix {
+                    if entry_prefix.as_deref() == Some(limit_prefix.as_str()) {
+                        after = entry.key;
+                        continue;
+                    }
+                    truncated = true;
+                    next_cursor = Some(after.clone());
+                    break 'scan;
                 }
-                continue;
+
+                after = entry.key.clone();
+                if let Some(common) = entry_prefix {
+                    let is_new = seen.insert(common.clone());
+                    if is_new {
+                        common_prefixes.push(CommonPrefix {
+                            prefix: common.clone(),
+                        });
+                    }
+                    if is_new && contents.len() + common_prefixes.len() >= max_keys {
+                        limit_prefix = Some(common);
+                    }
+                } else {
+                    contents.push(ObjectXml {
+                        key: entry.key.clone(),
+                        last_modified: format_time(entry.modified_at),
+                        etag: quoted(&entry.etag),
+                        size: entry.size,
+                        storage_class: "STANDARD".to_string(),
+                    });
+                    if contents.len() + common_prefixes.len() >= max_keys {
+                        let has_more = !engine
+                            .db
+                            .list_objects(bucket, &prefix, &after, 1)
+                            .await?
+                            .is_empty();
+                        truncated = has_more;
+                        if has_more {
+                            next_cursor = Some(after.clone());
+                        }
+                        break 'scan;
+                    }
+                }
+            }
+            if page_len < SCAN_BATCH_SIZE {
+                break;
             }
         }
-        contents.push(ObjectXml {
-            key: entry.key.clone(),
-            last_modified: format_time(entry.modified_at),
-            etag: quoted(&entry.etag),
-            size: entry.size,
-            storage_class: "STANDARD".to_string(),
-        });
     }
-    let next = if truncated {
-        shown
-            .last()
-            .map(|entry| base64::engine::general_purpose::STANDARD.encode(entry.key.as_bytes()))
-    } else {
-        None
-    };
+    let next = next_cursor
+        .as_deref()
+        .map(|cursor| base64::engine::general_purpose::STANDARD.encode(cursor.as_bytes()));
     xml_response(ListBucketResult {
         name: bucket.to_string(),
         prefix,
@@ -596,9 +651,10 @@ async fn list_objects(
         } else {
             query_value(query, "marker")
         },
+        start_after,
         continuation_token: query_value(query, "continuation-token"),
         next_marker: if truncated && !is_v2 {
-            shown.last().map(|entry| entry.key.clone())
+            next_cursor
         } else {
             None
         },
@@ -606,6 +662,15 @@ async fn list_objects(
         contents,
         common_prefixes,
     })
+}
+
+fn common_prefix(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
+    if delimiter.is_empty() {
+        return None;
+    }
+    let rest = key.strip_prefix(prefix).unwrap_or(key);
+    rest.find(delimiter)
+        .map(|index| format!("{}{}", prefix, &rest[..index + delimiter.len()]))
 }
 
 async fn get_object(
@@ -656,6 +721,7 @@ async fn copy_object(
     key: &str,
     source: &str,
     headers: &HeaderMap,
+    condition: &ObjectCondition,
 ) -> Result<Response> {
     let (source_bucket, source_key) = parse_copy_source(source)?;
     let source_object = state.engine.get_object(&source_bucket, &source_key).await?;
@@ -672,7 +738,14 @@ async fn copy_object(
     };
     let object = state
         .engine
-        .copy_object(&source_bucket, &source_key, bucket, key, &metadata)
+        .copy_object(
+            &source_bucket,
+            &source_key,
+            bucket,
+            key,
+            &metadata,
+            condition,
+        )
         .await?;
     xml_response(CopyObjectResult {
         etag: quoted(&object.etag),
@@ -747,27 +820,39 @@ async fn list_multipart_uploads(engine: &Engine, bucket: &str) -> Result<Respons
 }
 
 async fn multi_delete(engine: &Engine, bucket: &str, body: Body) -> Result<Response> {
+    if !engine.db.bucket_exists(bucket).await? {
+        bail!("NoSuchBucket");
+    }
     let bytes = to_bytes(body, 4 * 1024 * 1024).await?;
     let request: DeleteRequest =
         from_str(std::str::from_utf8(&bytes).map_err(|_| anyhow!("MalformedXML"))?)
             .map_err(|_| anyhow!("MalformedXML"))?;
+    let DeleteRequest { objects, quiet } = request;
+    if objects.is_empty() || objects.len() > 1000 {
+        bail!("InvalidRequest");
+    }
     let mut deleted = Vec::new();
-    for object in request.objects {
+    let condition = ObjectCondition::default();
+    for object in objects {
         let key = object.key;
-        let _ = engine.delete_object(bucket, &key).await?;
+        let _ = engine.delete_object(bucket, &key, &condition).await?;
         deleted.push(DeletedXml { key });
     }
-    xml_response(DeleteResult { deleted })
+    xml_response(DeleteResult {
+        deleted: (!quiet).then_some(deleted),
+    })
 }
 
 fn parse_copy_source(source: &str) -> Result<(String, String)> {
     let source = source.trim_start_matches('/');
     let mut parts = source.splitn(2, '/');
     let bucket = percent_encoding::percent_decode_str(parts.next().unwrap_or_default())
-        .decode_utf8()?
+        .decode_utf8()
+        .map_err(|_| anyhow!("InvalidRequest"))?
         .to_string();
     let key = percent_encoding::percent_decode_str(parts.next().unwrap_or_default())
-        .decode_utf8()?
+        .decode_utf8()
+        .map_err(|_| anyhow!("InvalidRequest"))?
         .to_string();
     if bucket.is_empty() || key.is_empty() {
         bail!("InvalidRequest");
@@ -855,6 +940,7 @@ fn object_headers(
 }
 
 fn check_conditions(object: &ObjectRecord, headers: &HeaderMap) -> Result<()> {
+    let has_if_match = headers.contains_key(header::IF_MATCH);
     if let Some(value) = headers
         .get(header::IF_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -865,6 +951,7 @@ fn check_conditions(object: &ObjectRecord, headers: &HeaderMap) -> Result<()> {
     {
         bail!("PreconditionFailed");
     }
+    let has_if_none_match = headers.contains_key(header::IF_NONE_MATCH);
     if let Some(value) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -875,9 +962,10 @@ fn check_conditions(object: &ObjectRecord, headers: &HeaderMap) -> Result<()> {
     {
         bail!("NotModified");
     }
-    if let Some(value) = headers
-        .get(header::IF_UNMODIFIED_SINCE)
-        .and_then(|value| value.to_str().ok())
+    if !has_if_match
+        && let Some(value) = headers
+            .get(header::IF_UNMODIFIED_SINCE)
+            .and_then(|value| value.to_str().ok())
         && let Ok(timestamp) = httpdate::parse_http_date(value)
     {
         let modified = std::time::UNIX_EPOCH
@@ -886,9 +974,10 @@ fn check_conditions(object: &ObjectRecord, headers: &HeaderMap) -> Result<()> {
             bail!("PreconditionFailed");
         }
     }
-    if let Some(value) = headers
-        .get(header::IF_MODIFIED_SINCE)
-        .and_then(|value| value.to_str().ok())
+    if !has_if_none_match
+        && let Some(value) = headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|value| value.to_str().ok())
         && let Ok(timestamp) = httpdate::parse_http_date(value)
     {
         let modified = std::time::UNIX_EPOCH
@@ -900,40 +989,22 @@ fn check_conditions(object: &ObjectRecord, headers: &HeaderMap) -> Result<()> {
     Ok(())
 }
 
-fn check_write_conditions(object: Option<ObjectRecord>, headers: &HeaderMap) -> Result<()> {
-    if let Some(value) = headers
-        .get(header::IF_MATCH)
-        .and_then(|value| value.to_str().ok())
-    {
-        let matches = object
-            .as_ref()
-            .map(|object| {
-                value == "*"
-                    || value
-                        .split(',')
-                        .any(|candidate| normalize_etag(candidate) == object.etag)
-            })
-            .unwrap_or(false);
-        if !matches {
-            bail!("PreconditionFailed");
-        }
+fn object_condition(headers: &HeaderMap) -> ObjectCondition {
+    ObjectCondition {
+        if_match: headers
+            .get(header::IF_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
+        if_none_match: headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
     }
-    if let Some(value) = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-    {
-        let matches = object
-            .as_ref()
-            .map(|object| {
-                value == "*"
-                    || value
-                        .split(',')
-                        .any(|candidate| normalize_etag(candidate) == object.etag)
-            })
-            .unwrap_or(false);
-        if matches {
-            bail!("PreconditionFailed");
-        }
+}
+
+fn check_write_conditions(object: Option<ObjectRecord>, condition: &ObjectCondition) -> Result<()> {
+    if !condition.allows(object.as_ref().map(|object| object.etag.as_str())) {
+        bail!("PreconditionFailed");
     }
     Ok(())
 }
@@ -1032,9 +1103,6 @@ fn query_value(query: &[(String, String)], name: &str) -> Option<String> {
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.clone())
 }
-fn normalize_etag(value: &str) -> String {
-    value.trim().trim_matches('"').to_string()
-}
 fn quoted(value: &str) -> String {
     format!("\"{value}\"")
 }
@@ -1073,6 +1141,41 @@ mod tests {
     }
 
     #[test]
+    fn etag_conditions_take_precedence_over_date_conditions() -> Result<()> {
+        let object = ObjectRecord {
+            id: 1,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            size: 0,
+            etag: "current".to_string(),
+            metadata: ObjectMetadata::default(),
+            created_at: 100,
+            modified_at: 100,
+            blocks: Vec::new(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"old\""));
+        headers.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_str(&httpdate::fmt_http_date(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(200),
+            ))?,
+        );
+        check_conditions(&object, &headers)?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"current\""));
+        headers.insert(
+            header::IF_UNMODIFIED_SINCE,
+            HeaderValue::from_str(&httpdate::fmt_http_date(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(50),
+            ))?,
+        );
+        check_conditions(&object, &headers)?;
+        Ok(())
+    }
+
+    #[test]
     fn parses_path_style_and_validates_bucket_names() -> Result<()> {
         let uri: Uri = "/my-bucket/folder%2Ffile.txt".parse()?;
         let target = Target::parse(&uri, &HeaderMap::new(), None)?;
@@ -1097,6 +1200,68 @@ mod tests {
         let body = std::str::from_utf8(&body)?;
         assert!(body.contains("<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"));
         assert!(!body.contains("<ErrorXml"));
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_s3_multipart_and_location_roots() -> Result<()> {
+        let initiate = to_string(&InitiateMultipartUpload {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            upload_id: "upload".to_string(),
+        })?;
+        assert!(initiate.starts_with("<InitiateMultipartUploadResult>"));
+
+        let complete = to_string(&CompleteMultipartResult {
+            location: "/bucket/key".to_string(),
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            etag: "etag".to_string(),
+        })?;
+        assert!(complete.starts_with("<CompleteMultipartUploadResult>"));
+
+        let location = to_string(&BucketLocation {
+            location: "us-east-1".to_string(),
+        })?;
+        assert_eq!(
+            location,
+            "<LocationConstraint>us-east-1</LocationConstraint>"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maps_s3_error_codes_to_http_statuses() {
+        assert_eq!(
+            status_for(&anyhow!("InvalidRequest")),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(status_for(&anyhow!("BucketNotEmpty")), StatusCode::CONFLICT);
+        assert_eq!(
+            status_for(&anyhow!("MethodNotAllowed")),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            status_for(&anyhow!("NotImplemented")),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            public_error_message("InternalError", &anyhow!("database path: /secret")),
+            "Internal server error"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_paths_as_client_errors() -> Result<()> {
+        let uri: Uri = "/bucket/%FF".parse()?;
+        let error = Target::parse(&uri, &HeaderMap::new(), None)
+            .err()
+            .ok_or_else(|| anyhow!("expected invalid path error"))?;
+        assert_eq!(status_for(&error), StatusCode::BAD_REQUEST);
+        let error = parse_copy_source("/bucket/%FF")
+            .err()
+            .ok_or_else(|| anyhow!("expected invalid copy source error"))?;
+        assert_eq!(status_for(&error), StatusCode::BAD_REQUEST);
         Ok(())
     }
 }
@@ -1127,9 +1292,11 @@ fn status_for(error: &anyhow::Error) -> StatusCode {
         "NoSuchKey" | "NoSuchBucket" | "NoSuchUpload" => StatusCode::NOT_FOUND,
         "PreconditionFailed" => StatusCode::PRECONDITION_FAILED,
         "NotModified" => StatusCode::NOT_MODIFIED,
-        "BucketNotEmpty" | "EntityTooSmall" | "InvalidPart" | "InvalidPartOrder"
-        | "InvalidArgument" | "InvalidBucketName" | "MalformedXML" | "NotImplemented"
-        | "MethodNotAllowed" => StatusCode::BAD_REQUEST,
+        "BucketNotEmpty" => StatusCode::CONFLICT,
+        "InvalidRequest" | "EntityTooSmall" | "InvalidPart" | "InvalidPartOrder"
+        | "InvalidArgument" | "InvalidBucketName" | "MalformedXML" => StatusCode::BAD_REQUEST,
+        "MethodNotAllowed" => StatusCode::METHOD_NOT_ALLOWED,
+        "NotImplemented" => StatusCode::NOT_IMPLEMENTED,
         "InvalidRange" => StatusCode::RANGE_NOT_SATISFIABLE,
         "AccessDenied" | "SignatureDoesNotMatch" | "RequestTimeTooSkewed" => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1148,6 +1315,7 @@ fn error_code(error: &anyhow::Error) -> String {
         "EntityTooSmall",
         "InvalidPartOrder",
         "InvalidPart",
+        "InvalidRequest",
         "InvalidRange",
         "InvalidArgument",
         "InvalidBucketName",
@@ -1163,6 +1331,45 @@ fn error_code(error: &anyhow::Error) -> String {
         }
     }
     "InternalError".to_string()
+}
+
+fn public_error_message(code: &str, error: &anyhow::Error) -> String {
+    if code == "InternalError" {
+        "Internal server error".to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+fn log_request_failure(
+    request_id: &str,
+    method: &Method,
+    path: &str,
+    status: StatusCode,
+    code: &str,
+    error: &anyhow::Error,
+) {
+    if matches!(code, "NoSuchKey" | "NoSuchUpload") {
+        tracing::debug!(
+            request_id,
+            %method,
+            path,
+            %status,
+            code,
+            error = %error,
+            "S3 request failed"
+        );
+    } else {
+        tracing::error!(
+            request_id,
+            %method,
+            path,
+            %status,
+            code,
+            error = %error,
+            "S3 request failed"
+        );
+    }
 }
 
 fn error_response(
@@ -1251,7 +1458,8 @@ impl Target {
 
 fn decode_path(path: &str) -> Result<String> {
     Ok(percent_encoding::percent_decode_str(path)
-        .decode_utf8()?
+        .decode_utf8()
+        .map_err(|_| anyhow!("InvalidRequest"))?
         .to_string())
 }
 
@@ -1288,6 +1496,8 @@ struct ListBucketResult {
     is_truncated: bool,
     #[serde(rename = "Marker", skip_serializing_if = "Option::is_none")]
     marker: Option<String>,
+    #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
+    start_after: Option<String>,
     #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
     continuation_token: Option<String>,
     #[serde(rename = "NextMarker", skip_serializing_if = "Option::is_none")]
@@ -1321,8 +1531,9 @@ struct CommonPrefix {
     prefix: String,
 }
 #[derive(Serialize)]
+#[serde(rename = "LocationConstraint")]
 struct BucketLocation {
-    #[serde(rename = "LocationConstraint")]
+    #[serde(rename = "$text")]
     location: String,
 }
 
@@ -1412,6 +1623,7 @@ impl CorsConfigurationXml {
 }
 
 #[derive(Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult")]
 struct InitiateMultipartUpload {
     #[serde(rename = "Bucket")]
     bucket: String,
@@ -1421,6 +1633,7 @@ struct InitiateMultipartUpload {
     upload_id: String,
 }
 #[derive(Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult")]
 struct CompleteMultipartResult {
     #[serde(rename = "Location")]
     location: String,
@@ -1478,8 +1691,8 @@ struct UploadXml {
 }
 #[derive(Serialize)]
 struct DeleteResult {
-    #[serde(rename = "Deleted", default)]
-    deleted: Vec<DeletedXml>,
+    #[serde(rename = "Deleted", skip_serializing_if = "Option::is_none")]
+    deleted: Option<Vec<DeletedXml>>,
 }
 #[derive(Serialize)]
 struct DeletedXml {
@@ -1515,6 +1728,8 @@ struct CompletedPart {
 struct DeleteRequest {
     #[serde(rename = "Object", default)]
     objects: Vec<DeleteObject>,
+    #[serde(rename = "Quiet", default)]
+    quiet: bool,
 }
 #[derive(Deserialize)]
 struct DeleteObject {

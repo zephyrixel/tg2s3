@@ -1,5 +1,41 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObjectCondition {
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+}
+
+impl ObjectCondition {
+    pub fn allows(&self, etag: Option<&str>) -> bool {
+        if let Some(value) = &self.if_match
+            && !etag_matches(value, etag)
+        {
+            return false;
+        }
+        if let Some(value) = &self.if_none_match
+            && etag_matches(value, etag)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+pub fn normalize_etag(value: &str) -> String {
+    value.trim().trim_matches('"').to_string()
+}
+
+fn etag_matches(value: &str, etag: Option<&str>) -> bool {
+    let Some(etag) = etag else {
+        return false;
+    };
+    value == "*"
+        || value
+            .split(',')
+            .any(|candidate| normalize_etag(candidate) == etag)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub content_type: Option<String>,
@@ -97,6 +133,29 @@ pub struct ListingRecord {
     pub size: i64,
     pub etag: String,
     pub modified_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluates_etag_conditions() {
+        let condition = ObjectCondition {
+            if_match: Some("\"one\", \"two\"".to_string()),
+            if_none_match: None,
+        };
+        assert!(condition.allows(Some("one")));
+        assert!(!condition.allows(Some("three")));
+        assert!(!condition.allows(None));
+
+        let condition = ObjectCondition {
+            if_match: None,
+            if_none_match: Some("*".to_string()),
+        };
+        assert!(condition.allows(None));
+        assert!(!condition.allows(Some("one")));
+    }
 }
 
 #[allow(dead_code)]
