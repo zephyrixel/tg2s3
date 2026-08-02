@@ -1,4 +1,39 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TelegramBackend {
+    #[default]
+    BotApi,
+    Grammers,
+}
+
+impl TelegramBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BotApi => "bot_api",
+            Self::Grammers => "grammers",
+        }
+    }
+}
+
+impl fmt::Display for TelegramBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TelegramBackend {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bot_api" | "bot-api" => Ok(Self::BotApi),
+            "grammers" | "mtproto" => Ok(Self::Grammers),
+            _ => Err("expected bot_api or grammers"),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObjectCondition {
@@ -82,6 +117,8 @@ pub struct BlockRef {
     pub size: i64,
     pub chat_id: i64,
     pub message_id: i64,
+    pub backend: TelegramBackend,
+    pub document_id: Option<i64>,
     pub file_id: String,
     pub file_unique_id: String,
     pub message_date: i64,
@@ -164,8 +201,30 @@ pub struct GarbageRecord {
     pub block_id: i64,
     pub chat_id: i64,
     pub message_id: i64,
+    pub backend: TelegramBackend,
+    pub document_id: Option<i64>,
+    pub file_id: String,
+    pub file_unique_id: String,
     pub message_date: i64,
     pub attempts: i64,
     pub next_attempt: i64,
     pub last_error: Option<String>,
+}
+
+impl GarbageRecord {
+    pub fn as_block_ref(&self) -> BlockRef {
+        BlockRef {
+            id: self.block_id,
+            ordinal: 0,
+            offset: 0,
+            size: 0,
+            chat_id: self.chat_id,
+            message_id: self.message_id,
+            backend: self.backend,
+            document_id: self.document_id,
+            file_id: self.file_id.clone(),
+            file_unique_id: self.file_unique_id.clone(),
+            message_date: self.message_date,
+        }
+    }
 }

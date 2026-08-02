@@ -1,11 +1,12 @@
 use crate::auth::SigV4;
 use crate::engine::Engine;
+use crate::limits::{TransferContext, TransferDirection, check_size};
 use crate::model::{
     CorsConfiguration, ObjectCondition, ObjectMetadata, ObjectRecord, normalize_etag,
 };
 use anyhow::{Result, anyhow, bail};
 use axum::body::{Body, to_bytes};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::get;
@@ -14,6 +15,7 @@ use quick_xml::{de::from_str, se::to_string};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::form_urlencoded;
@@ -60,6 +62,13 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
     let request_id = Uuid::new_v4().simple().to_string();
     let request_uri = parts.uri.clone();
     let request_headers = parts.headers.clone();
+    let client_ip = state.engine.limits.client_ip(
+        parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0),
+        &parts.headers,
+    );
     let query_keys = query_keys(&parts.uri);
     let is_cors_put = parts.method == Method::PUT
         && form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
@@ -131,6 +140,7 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
         request_id = %request_id,
         method = %parts.method,
         path = %request_uri.path(),
+        client_ip = %client_ip,
         query_keys = ?query_keys,
         host = ?request_headers.get(header::HOST).and_then(|value| value.to_str().ok()),
         "S3 request received"
@@ -143,6 +153,7 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
         parts.headers,
         body,
         &request_id,
+        client_ip,
     )
     .await
     {
@@ -177,6 +188,7 @@ async fn dispatch(
     headers: HeaderMap,
     body: Body,
     request_id: &str,
+    client_ip: IpAddr,
 ) -> Result<Response> {
     let target = Target::parse(&uri, &headers, state.public_host.as_deref())?;
     let query: Vec<(String, String)> =
@@ -198,7 +210,7 @@ async fn dispatch(
     }
     let key = target.key.as_ref().unwrap();
     dispatch_object(
-        state, method, bucket, key, &query, &headers, body, request_id,
+        state, method, bucket, key, &query, &headers, body, request_id, client_ip,
     )
     .await
 }
@@ -293,7 +305,8 @@ async fn dispatch_object(
     query: &[(String, String)],
     headers: &HeaderMap,
     body: Body,
-    _request_id: &str,
+    request_id: &str,
+    client_ip: IpAddr,
 ) -> Result<Response> {
     if !state.engine.db.bucket_exists(bucket).await? {
         bail!("NoSuchBucket");
@@ -315,9 +328,22 @@ async fn dispatch_object(
                     .ok_or_else(|| anyhow!("InvalidArgument"))?
                     .parse::<i32>()
                     .map_err(|_| anyhow!("InvalidArgument"))?;
+                let length = request_content_length(headers)?;
+                check_size(length, state.engine.limits.max_object_size)?;
+                let context = TransferContext {
+                    request_id: request_id.to_string(),
+                    client_ip,
+                    direction: TransferDirection::Upload,
+                };
+                let _permit = state
+                    .engine
+                    .limits
+                    .admission
+                    .acquire(TransferDirection::Upload, client_ip)
+                    .await?;
                 let part = state
                     .engine
-                    .upload_part(&upload_id, part_number, body)
+                    .upload_part(&upload_id, part_number, body, length, Some(context))
                     .await?;
                 let mut response = empty_response(StatusCode::OK);
                 response
@@ -347,13 +373,30 @@ async fn dispatch_object(
         let condition = object_condition(headers);
         check_write_conditions(state.engine.db.get_object(bucket, key).await?, &condition)?;
         let metadata = metadata_from_headers(headers);
-        let length = headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<i64>().ok());
+        let length = request_content_length(headers)?;
+        check_size(length, state.engine.limits.max_object_size)?;
+        let context = TransferContext {
+            request_id: request_id.to_string(),
+            client_ip,
+            direction: TransferDirection::Upload,
+        };
+        let _permit = state
+            .engine
+            .limits
+            .admission
+            .acquire(TransferDirection::Upload, client_ip)
+            .await?;
         let object = state
             .engine
-            .put_object(bucket, key, body, metadata, length, condition)
+            .put_object(
+                bucket,
+                key,
+                body,
+                metadata,
+                length,
+                condition,
+                Some(context),
+            )
             .await?;
         let mut response = empty_response(StatusCode::OK);
         response
@@ -375,7 +418,16 @@ async fn dispatch_object(
     } else if method == Method::POST {
         Err(anyhow!("NotImplemented"))
     } else if method == Method::GET || method == Method::HEAD {
-        get_object(&state.engine, bucket, key, headers, method == Method::HEAD).await
+        get_object(
+            &state.engine,
+            bucket,
+            key,
+            headers,
+            method == Method::HEAD,
+            request_id,
+            client_ip,
+        )
+        .await
     } else if method == Method::DELETE {
         let condition = object_condition(headers);
         check_write_conditions(state.engine.db.get_object(bucket, key).await?, &condition)?;
@@ -679,6 +731,8 @@ async fn get_object(
     key: &str,
     headers: &HeaderMap,
     head_only: bool,
+    request_id: &str,
+    client_ip: IpAddr,
 ) -> Result<Response> {
     let object = engine.get_object(bucket, key).await?;
     check_conditions(&object, headers)?;
@@ -698,10 +752,26 @@ async fn get_object(
     if object.size == 0 {
         response_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     }
+    let admission_permit = if !head_only && object.size > 0 {
+        Some(
+            engine
+                .limits
+                .admission
+                .acquire(TransferDirection::Download, client_ip)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let transfer = admission_permit.as_ref().map(|_| TransferContext {
+        request_id: request_id.to_string(),
+        client_ip,
+        direction: TransferDirection::Download,
+    });
     let body = if head_only || object.size == 0 {
         Body::empty()
     } else {
-        Body::from_stream(engine.range_stream(&object, start, end))
+        Body::from_stream(engine.range_stream(&object, start, end, admission_permit, transfer))
     };
     Ok((
         if partial {
@@ -1293,6 +1363,8 @@ fn status_for(error: &anyhow::Error) -> StatusCode {
         "PreconditionFailed" => StatusCode::PRECONDITION_FAILED,
         "NotModified" => StatusCode::NOT_MODIFIED,
         "BucketNotEmpty" => StatusCode::CONFLICT,
+        "EntityTooLarge" => StatusCode::PAYLOAD_TOO_LARGE,
+        "SlowDown" => StatusCode::SERVICE_UNAVAILABLE,
         "InvalidRequest" | "EntityTooSmall" | "InvalidPart" | "InvalidPartOrder"
         | "InvalidArgument" | "InvalidBucketName" | "MalformedXML" => StatusCode::BAD_REQUEST,
         "MethodNotAllowed" => StatusCode::METHOD_NOT_ALLOWED,
@@ -1309,6 +1381,8 @@ fn error_code(error: &anyhow::Error) -> String {
         "NoSuchKey",
         "NoSuchBucket",
         "NoSuchUpload",
+        "EntityTooLarge",
+        "SlowDown",
         "PreconditionFailed",
         "NotModified",
         "BucketNotEmpty",
@@ -1379,6 +1453,7 @@ fn error_response(
     uri: &Uri,
     request_id: &str,
 ) -> Response {
+    let retryable = code == "SlowDown";
     let response = ErrorXml {
         code,
         message: message.to_string(),
@@ -1397,7 +1472,25 @@ fn error_response(
         HeaderValue::from_static("application/xml"),
     );
     insert_header(response.headers_mut(), "x-amz-request-id", request_id);
+    if retryable {
+        insert_header(response.headers_mut(), "retry-after", "5");
+    }
     response
+}
+
+fn request_content_length(headers: &HeaderMap) -> Result<Option<i64>> {
+    let Some(value) = headers.get(header::CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| anyhow!("InvalidRequest"))?
+        .parse::<i64>()
+        .map_err(|_| anyhow!("InvalidRequest"))?;
+    if value < 0 {
+        bail!("InvalidRequest");
+    }
+    Ok(Some(value))
 }
 
 fn with_namespace(xml: &str) -> String {

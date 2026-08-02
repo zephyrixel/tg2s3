@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::model::BlockRef;
+use crate::model::{BlockRef, TelegramBackend};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use reqwest::{Client, StatusCode};
@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::sleep;
 
 #[derive(Clone)]
-pub struct TelegramClient {
+pub struct BotApiClient {
     token: String,
     chat_id: i64,
     api_url: String,
@@ -125,7 +125,7 @@ struct FileInfo {
     file_path: Option<String>,
 }
 
-impl TelegramClient {
+impl BotApiClient {
     pub fn new(config: &Config) -> Result<Self> {
         let client = Client::builder()
             .pool_max_idle_per_host(
@@ -428,6 +428,8 @@ impl From<UploadedDocument> for BlockRef {
             size: document.file_size,
             chat_id: 0,
             message_id: document.message_id,
+            backend: TelegramBackend::BotApi,
+            document_id: None,
             file_id: document.file_id,
             file_unique_id: document.file_unique_id,
             message_date: document.message_date,
@@ -510,7 +512,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client = TelegramClient {
+        let client = BotApiClient {
             token: String::new(),
             chat_id: 0,
             api_url: String::new(),

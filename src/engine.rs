@@ -1,8 +1,11 @@
 use crate::config::Config;
 use crate::db::Db;
+use crate::limits::{
+    AdmissionPermit, TransferContext, TransferDirection, TransferLimits, check_size,
+};
 use crate::model::{
-    BlockRef, ObjectCondition, ObjectMetadata, ObjectRecord, PartRecord, UploadRecord,
-    normalize_etag,
+    BlockRef, ObjectCondition, ObjectMetadata, ObjectRecord, PartRecord, TelegramBackend,
+    UploadRecord, normalize_etag,
 };
 use crate::telegram::{TelegramClient, is_missing_message};
 use anyhow::{Result, anyhow, bail};
@@ -24,6 +27,7 @@ pub struct Engine {
     pub db: Db,
     pub telegram: TelegramClient,
     pub config: Arc<Config>,
+    pub limits: Arc<TransferLimits>,
     upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
 }
@@ -34,6 +38,8 @@ struct UploadedBlock {
     offset: i64,
     data_size: i64,
     message_id: i64,
+    backend: TelegramBackend,
+    document_id: Option<i64>,
     file_id: String,
     file_unique_id: String,
     message_date: i64,
@@ -41,17 +47,20 @@ struct UploadedBlock {
 
 impl Engine {
     pub fn new(config: Config, db: Db, telegram: TelegramClient) -> Self {
+        let limits = Arc::new(TransferLimits::new(&config));
         let slots = Arc::new(Semaphore::new(config.upload_concurrency));
         let download_slots = Arc::new(Semaphore::new(config.download_concurrency));
         Self {
             db,
             telegram,
             config: Arc::new(config),
+            limits,
             upload_slots: slots,
             download_slots,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -60,8 +69,10 @@ impl Engine {
         metadata: ObjectMetadata,
         expected_length: Option<i64>,
         condition: ObjectCondition,
+        transfer: Option<TransferContext>,
     ) -> Result<ObjectRecord> {
         self.require_bucket(bucket).await?;
+        check_size(expected_length, self.config.max_object_size)?;
         let upload_id = format!("put-{}", Uuid::new_v4());
         self.db
             .create_upload(&UploadRecord {
@@ -74,7 +85,9 @@ impl Engine {
             })
             .await?;
         let result = async {
-            let (part, actual_length) = self.upload_stream(&upload_id, 0, body).await?;
+            let (part, actual_length) = self
+                .upload_stream(&upload_id, 0, body, expected_length, transfer.as_ref())
+                .await?;
             if let Some(expected) = expected_length
                 && expected != actual_length
             {
@@ -126,6 +139,8 @@ impl Engine {
         upload_id: &str,
         part_number: i32,
         body: Body,
+        expected_length: Option<i64>,
+        transfer: Option<TransferContext>,
     ) -> Result<PartRecord> {
         if !(1..=10_000).contains(&part_number) {
             bail!("part number must be between 1 and 10,000");
@@ -138,7 +153,16 @@ impl Engine {
         if upload.kind != "multipart" {
             bail!("NoSuchUpload");
         }
-        let (part, size) = self.upload_stream(upload_id, part_number, body).await?;
+        check_size(expected_length, self.config.max_object_size)?;
+        let (part, size) = self
+            .upload_stream(
+                upload_id,
+                part_number,
+                body,
+                expected_length,
+                transfer.as_ref(),
+            )
+            .await?;
         self.db
             .replace_part(upload_id, part_number, size, &part.etag, &part.blocks)
             .await?;
@@ -198,6 +222,9 @@ impl Engine {
             total_size = total_size
                 .checked_add(part.size)
                 .ok_or_else(|| anyhow!("multipart object is too large"))?;
+            if total_size > self.config.max_object_size {
+                bail!("EntityTooLarge");
+            }
             ordered.push(part.clone());
         }
         let etag = format!("{:x}-{}", composite.finalize(), requested.len());
@@ -279,6 +306,8 @@ impl Engine {
         object: &ObjectRecord,
         start: i64,
         end: i64,
+        admission_permit: Option<AdmissionPermit>,
+        transfer: Option<TransferContext>,
     ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
         let telegram = self.telegram.clone();
         let blocks = object.blocks.clone();
@@ -289,6 +318,9 @@ impl Engine {
             index: 0,
             start,
             end,
+            _admission_permit: admission_permit,
+            limits: self.limits.clone(),
+            transfer,
             download_permit: None,
         };
         stream::unfold(state, |mut state| async move {
@@ -310,11 +342,27 @@ impl Engine {
                 };
                 let result = state
                     .telegram
-                    .download_chunk(&block.file_id, read_start, read_end)
+                    .download_chunk(&block, read_start, read_end)
                     .await;
                 state.download_permit = Some(permit);
                 match result {
-                    Ok(bytes) => return Some((Ok(bytes), state)),
+                    Ok(bytes) => {
+                        if let Some(transfer) = &state.transfer
+                            && let Err(error) = state
+                                .limits
+                                .bandwidth
+                                .throttle(
+                                    TransferDirection::Download,
+                                    transfer.client_ip,
+                                    bytes.len(),
+                                    false,
+                                )
+                                .await
+                        {
+                            return Some((Err(std::io::Error::other(error)), state));
+                        }
+                        return Some((Ok(bytes), state));
+                    }
                     Err(error) => return Some((Err(std::io::Error::other(error)), state)),
                 }
             }
@@ -344,7 +392,8 @@ impl Engine {
                 processed += 1;
                 continue;
             }
-            match self.telegram.delete_message(candidate.message_id).await {
+            let block = candidate.as_block_ref();
+            match self.telegram.delete_message(&block).await {
                 Ok(()) => self.db.gc_success(candidate.block_id).await?,
                 Err(error) if is_missing_message(&error) => {
                     self.db.gc_success(candidate.block_id).await?;
@@ -365,6 +414,8 @@ impl Engine {
         upload_id: &str,
         part_number: i32,
         body: Body,
+        expected_length: Option<i64>,
+        transfer: Option<&TransferContext>,
     ) -> Result<(PartRecord, i64)> {
         let mut stream = body.into_data_stream();
         let mut tasks = futures_util::stream::FuturesUnordered::new();
@@ -379,10 +430,29 @@ impl Engine {
         loop {
             match stream.next().await {
                 Some(Ok(data)) => {
+                    if let Some(transfer) = transfer
+                        && let Err(error) = self
+                            .limits
+                            .bandwidth
+                            .throttle(
+                                TransferDirection::Upload,
+                                transfer.client_ip,
+                                data.len(),
+                                true,
+                            )
+                            .await
+                    {
+                        read_error = Some(error);
+                        break;
+                    }
                     digest.update(&data);
                     total = total
                         .checked_add(data.len() as i64)
                         .ok_or_else(|| anyhow!("object is too large"))?;
+                    if total > self.config.max_object_size {
+                        read_error = Some(anyhow!("EntityTooLarge"));
+                        break;
+                    }
                     buffer.extend_from_slice(&data);
                     while buffer.len() >= self.config.chunk_size {
                         let chunk = buffer.split_to(self.config.chunk_size).freeze();
@@ -472,6 +542,11 @@ impl Engine {
         if let Some(error) = task_error {
             return Err(error);
         }
+        if let Some(expected_length) = expected_length
+            && expected_length != total
+        {
+            bail!("request Content-Length {expected_length} does not match body length {total}");
+        }
         let etag = format!("{:x}", digest.finalize());
         Ok((
             PartRecord {
@@ -499,6 +574,8 @@ impl Engine {
                 size: block.data_size,
                 chat_id: self.config.chat_id,
                 message_id: block.message_id,
+                backend: block.backend,
+                document_id: block.document_id,
                 file_id: block.file_id.clone(),
                 file_unique_id: block.file_unique_id.clone(),
                 message_date: block.message_date,
@@ -507,8 +584,10 @@ impl Engine {
                 Ok(id) => id,
                 Err(error) => {
                     for orphan in uploaded.iter().skip(index) {
-                        if let Err(cleanup_error) =
-                            self.telegram.delete_message(orphan.message_id).await
+                        if let Err(cleanup_error) = self
+                            .telegram
+                            .delete_message_by_id(orphan.backend, orphan.message_id)
+                            .await
                         {
                             tracing::warn!(
                                 message_id = orphan.message_id,
@@ -552,6 +631,8 @@ impl Engine {
                 offset,
                 data_size: size,
                 message_id: document.message_id,
+                backend: document.backend,
+                document_id: document.document_id,
                 file_id: document.file_id,
                 file_unique_id: document.file_unique_id,
                 message_date: document.message_date,
@@ -574,6 +655,9 @@ struct RangeState {
     index: usize,
     start: i64,
     end: i64,
+    _admission_permit: Option<AdmissionPermit>,
+    limits: Arc<TransferLimits>,
+    transfer: Option<TransferContext>,
     download_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -763,6 +847,8 @@ mod tests {
                 size: 3,
                 chat_id: -100,
                 message_id: 1,
+                backend: TelegramBackend::BotApi,
+                document_id: None,
                 file_id: "file".to_string(),
                 file_unique_id: "unique".to_string(),
                 message_date: 1,
@@ -807,12 +893,19 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             bot_token: "token".to_string(),
             chat_id: -100,
+            telegram_backend: TelegramBackend::BotApi,
             telegram_api_url: format!("http://{address}"),
             local_bot_api: false,
             chunk_size: 4,
             upload_concurrency: 2,
             download_concurrency: 2,
             telegram_timeout_secs: 300,
+            grammers_api_id: None,
+            grammers_api_hash: None,
+            grammers_session_path: directory.path().join("grammers.session.sqlite3"),
+            grammers_chat_username: None,
+            grammers_chat_access_hash: None,
+            grammers_max_flood_wait_secs: 30,
             access_key: None,
             secret_key: None,
             allow_anonymous: true,
@@ -822,6 +915,16 @@ mod tests {
             cors: crate::model::CorsConfiguration::default(),
             gc_interval: 300,
             gc_limit: 100,
+            max_object_size: crate::config::DEFAULT_MAX_OBJECT_SIZE,
+            max_active_transfers: 16,
+            max_active_uploads_per_ip: 2,
+            max_active_downloads_per_ip: 4,
+            limit_wait_secs: 5,
+            upload_rate_bps: 0,
+            download_rate_bps: 0,
+            upload_rate_bps_per_ip: 0,
+            download_rate_bps_per_ip: 0,
+            trusted_proxy_cidrs: Vec::new(),
         };
         let db = Db::open(&config.db_path).await?;
         db.create_bucket("bucket").await?;
@@ -836,10 +939,11 @@ mod tests {
                 ObjectMetadata::default(),
                 Some(data.len() as i64),
                 ObjectCondition::default(),
+                None,
             )
             .await?;
         assert_eq!(object.size, data.len() as i64);
-        let mut stream = Box::pin(engine.range_stream(&object, 6, 13));
+        let mut stream = Box::pin(engine.range_stream(&object, 6, 13, None, None));
         let mut result = Vec::new();
         while let Some(chunk) = stream.next().await {
             result.extend_from_slice(&chunk?);

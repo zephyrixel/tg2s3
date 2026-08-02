@@ -5,6 +5,11 @@ Object bytes are stored as Telegram documents; SQLite under `./data` stores
 metadata, Telegram message references, multipart state, CORS overrides, and
 garbage-collection state.
 
+The default transport is the Bot API. An optional `grammers` MTProto transport
+can be selected for streaming Telegram downloads and larger document chunks.
+The transport is recorded for every stored block, so existing Bot API objects
+remain readable when new objects use grammers.
+
 This is a single-process local service. Telegram is not a replicated object
 store: back up `./data` and preserve the same Bot identity. Objects are stored
 in plaintext in the configured Telegram chat.
@@ -105,6 +110,38 @@ cargo run -- serve
 Useful commands are `cargo run -- init`, `cargo run -- check`,
 `cargo run -- inspect`, and `cargo run -- gc`.
 
+### grammers MTProto backend
+
+Use this backend when Bot API `getFile` behavior or its public file-size limit
+is unsuitable. It uses the same BotFather bot account, but also requires an
+API ID and API hash from `my.telegram.org`:
+
+```dotenv
+TG2S3_TELEGRAM_BACKEND=grammers
+TG2S3_TELEGRAM_API_ID=123456
+TG2S3_TELEGRAM_API_HASH=replace-with-api-hash
+TG2S3_GRAMMERS_CHAT_USERNAME=storage_channel
+# Or use the numeric channel access hash instead of the username:
+# TG2S3_GRAMMERS_CHAT_ACCESS_HASH=1234567890123456789
+TG2S3_GRAMMERS_SESSION_PATH=./data/grammers.session.sqlite3
+```
+
+Configure exactly one of `TG2S3_GRAMMERS_CHAT_USERNAME` and
+`TG2S3_GRAMMERS_CHAT_ACCESS_HASH`. The resolved channel must match
+`TG2S3_CHAT_ID`. On the first start, tg2s3 signs the bot into MTProto and
+persists the authorization session separately from `tg2s3.sqlite3`; back up
+both files together and restrict the session file permissions. The bot must
+be an administrator of the channel or supergroup, with message posting and
+deletion available.
+
+In grammers mode each upload block is sent as a Telegram document and reads
+use MTProto range downloads. No Bot API `getFile` call or local Bot API file
+cache is involved. The default chunk size is 64 MiB when
+`TG2S3_CHUNK_SIZE` is omitted; set it explicitly to tune memory and Telegram
+request behavior. Switching the backend does not move old messages. Existing
+blocks continue to use the backend stored in their metadata, so keep the
+grammers credentials available while a database contains grammers blocks.
+
 ## Cloudreve
 
 Use the public reverse-proxy URL as the Endpoint, keep the Bucket name equal
@@ -137,6 +174,33 @@ diagnostics without logging credentials or presigned query strings. If a
 reverse proxy is used, it must preserve the original `Host` header used by
 Cloudreve for SigV4 signing; do not mount tg2s3 under a URL path prefix.
 
+### Transfer limits and proxy client IPs
+
+`TG2S3_MAX_OBJECT_SIZE` rejects oversized single-part requests and multipart
+objects with `413 EntityTooLarge`. `TG2S3_MAX_ACTIVE_TRANSFERS` is the global
+in-flight transfer limit; upload and download limits can also be set per
+client IP. `TG2S3_LIMIT_WAIT_SECS` bounds admission waiting. When a limit is
+reached, the service returns `503 SlowDown` with `Retry-After: 5`.
+
+The four `*_RATE_BPS` variables apply byte-per-second backpressure. A value of
+`0` disables that rate. Upload throttling can return `SlowDown` if the next
+bounded wait exceeds `TG2S3_LIMIT_WAIT_SECS`; download throttling applies
+backpressure while the response stream is being produced.
+
+For deployments behind nginx, Caddy, or another reverse proxy, configure the
+proxy's directly connected address or network in
+`TG2S3_TRUSTED_PROXY_CIDRS`. Only then will `Forwarded`, `X-Forwarded-For`, or
+`X-Real-IP` select the client address; otherwise the immediate TCP peer is
+used, preventing clients from spoofing per-IP limits. For a host-local proxy,
+for example:
+
+```dotenv
+TG2S3_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
+```
+
+For Docker, use the actual proxy container network CIDR rather than copying
+the host-local example. Do not trust arbitrary public networks.
+
 ## Compatibility
 
 The implemented surface includes bucket/object CRUD, ListObjects and
@@ -161,13 +225,18 @@ defaults to 16 MiB chunks because of the public `getFile` download limit. A
 colocated local Bot API Server can be selected with
 `TG2S3_LOCAL_BOT_API=true` and a custom `TG2S3_TELEGRAM_API_URL`.
 
+The grammers backend additionally needs an API ID/API hash and a persistent
+session file. It defaults to 64 MiB chunks when `TG2S3_CHUNK_SIZE` is omitted
+and does not use the local Bot API cache.
+
 ## Database migrations
 
 Migration files are kept in the repository-level `migrations/` directory and
 are embedded into the binary by SQLx. Production migrations are forward-only;
 back up the SQLite volume before upgrading. Existing databases created by
 older tg2s3 versions are adopted by the baseline migration without deleting
-objects or Telegram references.
+objects or Telegram references. The grammers authorization session is a
+separate SQLite file and is not part of SQLx migrations.
 
 ## Telegram cleanup caveat
 

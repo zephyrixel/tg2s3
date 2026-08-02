@@ -1,6 +1,6 @@
 use crate::model::{
     BlockRef, BucketRecord, CorsConfiguration, GarbageRecord, ListingRecord, ObjectCondition,
-    ObjectMetadata, ObjectRecord, PartRecord, UploadRecord,
+    ObjectMetadata, ObjectRecord, PartRecord, TelegramBackend, UploadRecord,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -70,6 +70,16 @@ impl Db {
                 .bind(name)
                 .fetch_one(&self.pool)
                 .await?;
+        Ok(exists != 0)
+    }
+
+    pub async fn has_backend(&self, backend: TelegramBackend) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM telegram_blocks WHERE backend = ?1)",
+        )
+        .bind(backend.as_str())
+        .fetch_one(&self.pool)
+        .await?;
         Ok(exists != 0)
     }
 
@@ -235,12 +245,14 @@ impl Db {
     pub async fn add_staged_block(&self, block: &BlockRef) -> Result<i64> {
         let row = sqlx::query(
             "INSERT INTO telegram_blocks
-             (chat_id, message_id, file_id, file_unique_id, size, message_date, ref_count, state, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1, 'staged', ?7)
+             (chat_id, message_id, backend, document_id, file_id, file_unique_id, size, message_date, ref_count, state, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 'staged', ?9)
              RETURNING id",
         )
         .bind(block.chat_id)
         .bind(block.message_id)
+        .bind(block.backend.as_str())
+        .bind(block.document_id)
         .bind(&block.file_id)
         .bind(&block.file_unique_id)
         .bind(block.size)
@@ -613,7 +625,8 @@ impl Db {
     pub async fn gc_candidates(&self, timestamp: i64, limit: usize) -> Result<Vec<GarbageRecord>> {
         let limit = i64::try_from(limit).context("GC limit exceeds SQLite integer range")?;
         let rows = sqlx::query(
-            "SELECT q.block_id, b.chat_id, b.message_id, b.message_date,
+            "SELECT q.block_id, b.chat_id, b.message_id, b.backend, b.document_id,
+                    b.file_id, b.file_unique_id, b.message_date,
                     q.attempts, q.next_attempt, q.last_error
              FROM gc_queue q JOIN telegram_blocks b ON b.id = q.block_id
              WHERE q.state = 'pending' AND b.ref_count = 0 AND q.next_attempt <= ?1
@@ -623,18 +636,24 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| GarbageRecord {
-                block_id: row.get("block_id"),
-                chat_id: row.get("chat_id"),
-                message_id: row.get("message_id"),
-                message_date: row.get("message_date"),
-                attempts: row.get("attempts"),
-                next_attempt: row.get("next_attempt"),
-                last_error: row.get("last_error"),
+        rows.into_iter()
+            .map(|row| {
+                let backend = parse_backend(row.get("backend"))?;
+                Ok(GarbageRecord {
+                    block_id: row.get("block_id"),
+                    chat_id: row.get("chat_id"),
+                    message_id: row.get("message_id"),
+                    backend,
+                    document_id: row.get("document_id"),
+                    file_id: row.get("file_id"),
+                    file_unique_id: row.get("file_unique_id"),
+                    message_date: row.get("message_date"),
+                    attempts: row.get("attempts"),
+                    next_attempt: row.get("next_attempt"),
+                    last_error: row.get("last_error"),
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub async fn gc_success(&self, block_id: i64) -> Result<()> {
@@ -683,7 +702,8 @@ impl Db {
 
     pub async fn stale_blocks(&self, before: i64) -> Result<Vec<GarbageRecord>> {
         let rows = sqlx::query(
-            "SELECT b.id, b.chat_id, b.message_id, b.message_date
+            "SELECT b.id, b.chat_id, b.message_id, b.backend, b.document_id,
+                    b.file_id, b.file_unique_id, b.message_date
              FROM telegram_blocks b
              LEFT JOIN object_blocks ob ON ob.block_id = b.id
              LEFT JOIN multipart_part_blocks pb ON pb.block_id = b.id
@@ -693,18 +713,24 @@ impl Db {
         .bind(before)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| GarbageRecord {
-                block_id: row.get("id"),
-                chat_id: row.get("chat_id"),
-                message_id: row.get("message_id"),
-                message_date: row.get("message_date"),
-                attempts: 0,
-                next_attempt: 0,
-                last_error: None,
+        rows.into_iter()
+            .map(|row| {
+                let backend = parse_backend(row.get("backend"))?;
+                Ok(GarbageRecord {
+                    block_id: row.get("id"),
+                    chat_id: row.get("chat_id"),
+                    message_id: row.get("message_id"),
+                    backend,
+                    document_id: row.get("document_id"),
+                    file_id: row.get("file_id"),
+                    file_unique_id: row.get("file_unique_id"),
+                    message_date: row.get("message_date"),
+                    attempts: 0,
+                    next_attempt: 0,
+                    last_error: None,
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub async fn delete_stale_block(&self, block_id: i64) -> Result<()> {
@@ -822,14 +848,14 @@ fn validate_parts_layout(parts: &[PartRecord]) -> Result<i64> {
 async fn load_object_blocks(pool: &SqlitePool, object_id: i64) -> Result<Vec<BlockRef>> {
     let rows = sqlx::query(
         "SELECT b.id, ob.ordinal, ob.byte_offset, ob.size, b.chat_id, b.message_id,
-                b.file_id, b.file_unique_id, b.message_date
+                b.backend, b.document_id, b.file_id, b.file_unique_id, b.message_date
          FROM object_blocks ob JOIN telegram_blocks b ON b.id = ob.block_id
          WHERE ob.object_id = ?1 ORDER BY ob.ordinal",
     )
     .bind(object_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(block_from_row).collect())
+    rows.into_iter().map(block_from_row).collect()
 }
 
 async fn load_object_blocks_tx(
@@ -838,14 +864,14 @@ async fn load_object_blocks_tx(
 ) -> Result<Vec<BlockRef>> {
     let rows = sqlx::query(
         "SELECT b.id, ob.ordinal, ob.byte_offset, ob.size, b.chat_id, b.message_id,
-                b.file_id, b.file_unique_id, b.message_date
+                b.backend, b.document_id, b.file_id, b.file_unique_id, b.message_date
          FROM object_blocks ob JOIN telegram_blocks b ON b.id = ob.block_id
          WHERE ob.object_id = ?1 ORDER BY ob.ordinal",
     )
     .bind(object_id)
     .fetch_all(&mut **tx)
     .await?;
-    Ok(rows.into_iter().map(block_from_row).collect())
+    rows.into_iter().map(block_from_row).collect()
 }
 
 async fn load_part_blocks(
@@ -855,7 +881,7 @@ async fn load_part_blocks(
 ) -> Result<Vec<BlockRef>> {
     let rows = sqlx::query(
         "SELECT b.id, pb.ordinal, pb.byte_offset, pb.size, b.chat_id, b.message_id,
-                b.file_id, b.file_unique_id, b.message_date
+                b.backend, b.document_id, b.file_id, b.file_unique_id, b.message_date
          FROM multipart_part_blocks pb JOIN telegram_blocks b ON b.id = pb.block_id
          WHERE pb.upload_id = ?1 AND pb.part_number = ?2 ORDER BY pb.ordinal",
     )
@@ -863,21 +889,30 @@ async fn load_part_blocks(
     .bind(part_number)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(block_from_row).collect())
+    rows.into_iter().map(block_from_row).collect()
 }
 
-fn block_from_row(row: sqlx::sqlite::SqliteRow) -> BlockRef {
-    BlockRef {
+fn block_from_row(row: sqlx::sqlite::SqliteRow) -> Result<BlockRef> {
+    let backend = parse_backend(row.get(6))?;
+    Ok(BlockRef {
         id: row.get(0),
         ordinal: row.get(1),
         offset: row.get(2),
         size: row.get(3),
         chat_id: row.get(4),
         message_id: row.get(5),
-        file_id: row.get(6),
-        file_unique_id: row.get(7),
-        message_date: row.get(8),
-    }
+        backend,
+        document_id: row.get(7),
+        file_id: row.get(8),
+        file_unique_id: row.get(9),
+        message_date: row.get(10),
+    })
+}
+
+fn parse_backend(value: String) -> Result<TelegramBackend> {
+    value
+        .parse()
+        .map_err(|error| anyhow!("invalid Telegram block backend: {error}"))
 }
 
 async fn decrement_block(tx: &mut Transaction<'_, Sqlite>, block_id: i64) -> Result<()> {
@@ -911,6 +946,7 @@ async fn decrement_block(tx: &mut Transaction<'_, Sqlite>, block_id: i64) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TelegramBackend;
     use tempfile::tempdir;
 
     fn block(message_id: i64, size: i64) -> BlockRef {
@@ -921,6 +957,8 @@ mod tests {
             size,
             chat_id: -100,
             message_id,
+            backend: TelegramBackend::BotApi,
+            document_id: None,
             file_id: format!("file-{message_id}"),
             file_unique_id: format!("unique-{message_id}"),
             message_date: now(),
@@ -954,7 +992,11 @@ mod tests {
             created_at: now(),
         };
         db.create_upload(&upload).await?;
-        let staged = block(1, 3);
+        let staged = BlockRef {
+            backend: TelegramBackend::Grammers,
+            document_id: Some(42),
+            ..block(1, 3)
+        };
         let id = db.add_staged_block(&staged).await?;
         let staged = BlockRef { id, ..staged };
         let part = PartRecord {
@@ -976,6 +1018,13 @@ mod tests {
         )
         .await?
         .expect("commit");
+
+        let loaded = db
+            .get_object("bucket", "one")
+            .await?
+            .expect("loaded object");
+        assert_eq!(loaded.blocks[0].backend, TelegramBackend::Grammers);
+        assert_eq!(loaded.blocks[0].document_id, Some(42));
 
         let source = db
             .get_object("bucket", "one")
