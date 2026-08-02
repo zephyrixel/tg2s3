@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::Db;
 use super::support::{
-    block_from_row, decrement_block, ensure_blocks_not_queued, load_object_blocks_tx, now,
+    block_from_row, decrement_block, ensure_blocks_not_queued, now, remove_existing_object,
     upload_from_row, validate_parts_layout, verify_parts_tx,
 };
 
@@ -257,27 +257,10 @@ impl Db {
         let key: String = upload.get("object_key");
         let metadata_json: String = upload.get("metadata_json");
         let created_at: i64 = upload.get("created_at");
-        let mut old_blocks = Vec::new();
-        let old = sqlx::query("SELECT id, etag FROM objects WHERE bucket = ?1 AND object_key = ?2")
-            .bind(&bucket)
-            .bind(&key)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let old_etag = old.as_ref().map(|row| row.get::<String, _>("etag"));
-        if !condition.allows(old_etag.as_deref()) {
-            bail!("PreconditionFailed");
-        }
-        if let Some(old_id) = old {
-            let object_id: i64 = old_id.get("id");
-            old_blocks = load_object_blocks_tx(&mut tx, object_id).await?;
-            sqlx::query("DELETE FROM objects WHERE id = ?1")
-                .bind(object_id)
-                .execute(&mut *tx)
-                .await?;
-            for block in &old_blocks {
-                decrement_block(&mut tx, block.id).await?;
-            }
-        }
+        let mut old_blocks = remove_existing_object(&mut tx, &bucket, &key, condition)
+            .await?
+            .map(|(_, blocks)| blocks)
+            .unwrap_or_default();
         let modified_at = now();
         let object_row = sqlx::query(
             "INSERT INTO objects
@@ -327,6 +310,28 @@ impl Db {
                 ordinal += 1;
                 offset += block.size;
             }
+        }
+        // Release blocks of uploaded parts that the completion did not use so
+        // they are garbage collected instead of leaking in Telegram.
+        let used_parts: HashSet<i32> = parts.iter().map(|part| part.part_number).collect();
+        let unused_rows = sqlx::query(
+            "SELECT b.id, pb.ordinal, pb.byte_offset, pb.size, b.chat_id, b.message_id,
+                    b.backend, b.document_id, b.file_id, b.file_unique_id, b.message_date,
+                    pb.part_number
+             FROM multipart_part_blocks pb JOIN telegram_blocks b ON b.id = pb.block_id
+             WHERE pb.upload_id = ?1 ORDER BY pb.part_number, pb.ordinal",
+        )
+        .bind(upload_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in unused_rows {
+            let part_number: i32 = row.get("part_number");
+            if used_parts.contains(&part_number) {
+                continue;
+            }
+            let block = block_from_row(row)?;
+            decrement_block(&mut tx, block.id).await?;
+            old_blocks.push(block);
         }
         sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?1")
             .bind(upload_id)

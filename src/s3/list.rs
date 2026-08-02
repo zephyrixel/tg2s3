@@ -3,6 +3,7 @@ use super::xml::{
 };
 use super::{format_time, query_value, quoted};
 use crate::engine::Engine;
+use crate::model::key_successor;
 use anyhow::{Result, anyhow, bail};
 use axum::response::Response;
 use base64::Engine as _;
@@ -64,60 +65,83 @@ pub(super) async fn list_objects(
     let mut common_prefixes = Vec::new();
     let mut seen = HashSet::new();
     let mut truncated = false;
-    let mut next_cursor = None;
-    let mut limit_prefix: Option<String> = None;
+    let mut next_cursor: Option<String> = None;
+    // The request marker: keys and prefix groups at or below it were already
+    // returned on earlier pages, so a group whose prefix is <= floor is seeked
+    // past without being emitted again.
+    let floor = after.clone();
+    let mut lower = after;
+    let mut lower_inclusive = false;
     const SCAN_BATCH_SIZE: usize = 1000;
 
     if max_keys > 0 {
         'scan: loop {
             let entries = engine
                 .db
-                .list_objects(bucket, &prefix, &after, SCAN_BATCH_SIZE)
+                .list_objects(bucket, &prefix, &lower, lower_inclusive, SCAN_BATCH_SIZE)
                 .await?;
             let page_len = entries.len();
             if page_len == 0 {
                 break;
             }
             for entry in entries {
-                let entry_prefix = common_prefix(&entry.key, &prefix, &delimiter);
-                if let Some(limit_prefix) = &limit_prefix {
-                    if entry_prefix.as_deref() == Some(limit_prefix.as_str()) {
-                        after = entry.key;
-                        continue;
-                    }
-                    truncated = true;
-                    next_cursor = Some(after.clone());
-                    break 'scan;
+                // Skip entries already covered by an in-batch seek.
+                let in_bound = if lower_inclusive {
+                    entry.key >= lower
+                } else {
+                    entry.key > lower
+                };
+                if !in_bound {
+                    continue;
                 }
-
-                after = entry.key.clone();
-                if let Some(common) = entry_prefix {
-                    let is_new = seen.insert(common.clone());
-                    if is_new {
+                if let Some(common) = common_prefix(&entry.key, &prefix, &delimiter) {
+                    let emitted = common > floor && seen.insert(common.clone());
+                    if emitted {
                         common_prefixes.push(CommonPrefix {
                             prefix: common.clone(),
                         });
                     }
-                    if is_new && contents.len() + common_prefixes.len() >= max_keys {
-                        limit_prefix = Some(common);
+                    // Seek past every key in this group instead of scanning
+                    // them one by one.
+                    match key_successor(&common) {
+                        Some(bound) => {
+                            lower = bound;
+                            lower_inclusive = true;
+                        }
+                        None => {
+                            lower = entry.key;
+                            lower_inclusive = false;
+                        }
+                    }
+                    if contents.len() + common_prefixes.len() >= max_keys {
+                        truncated = !engine
+                            .db
+                            .list_objects(bucket, &prefix, &lower, lower_inclusive, 1)
+                            .await?
+                            .is_empty();
+                        if truncated {
+                            next_cursor = Some(common);
+                        }
+                        break 'scan;
                     }
                 } else {
+                    lower = entry.key.clone();
+                    lower_inclusive = false;
                     contents.push(ObjectXml {
-                        key: entry.key.clone(),
+                        key: entry.key,
                         last_modified: format_time(entry.modified_at),
                         etag: quoted(&entry.etag),
                         size: entry.size,
                         storage_class: "STANDARD".to_string(),
                     });
                     if contents.len() + common_prefixes.len() >= max_keys {
-                        let has_more = !engine
+                        truncated = !engine
                             .db
-                            .list_objects(bucket, &prefix, &after, 1)
+                            .list_objects(bucket, &prefix, &lower, false, 1)
                             .await?
                             .is_empty();
-                        truncated = has_more;
-                        if has_more {
-                            next_cursor = Some(after.clone());
+                        if truncated {
+                            next_cursor = Some(lower.clone());
                         }
                         break 'scan;
                     }

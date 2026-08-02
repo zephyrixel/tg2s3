@@ -109,6 +109,12 @@ fn maps_s3_error_codes_to_http_statuses() {
     );
     assert_eq!(status_for(&anyhow!("BucketNotEmpty")), StatusCode::CONFLICT);
     assert_eq!(
+        status_for(&anyhow!(
+            "IncompleteBody: request Content-Length 10 does not match body length 4"
+        )),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
         status_for(&anyhow!("MethodNotAllowed")),
         StatusCode::METHOD_NOT_ALLOWED
     );
@@ -116,10 +122,66 @@ fn maps_s3_error_codes_to_http_statuses() {
         status_for(&anyhow!("NotImplemented")),
         StatusCode::NOT_IMPLEMENTED
     );
+    // Longest-match ordering: InvalidPartOrder must not collapse to InvalidPart.
+    assert_eq!(error_code(&anyhow!("InvalidPartOrder")), "InvalidPartOrder");
     assert_eq!(
         public_error_message("InternalError", &anyhow!("database path: /secret")),
         "Internal server error"
     );
+}
+
+#[tokio::test]
+async fn not_modified_responses_have_no_body() -> Result<()> {
+    let uri: Uri = "/bucket/key".parse()?;
+    let response = error_response(
+        StatusCode::NOT_MODIFIED,
+        "NotModified".to_string(),
+        "not modified",
+        &uri,
+        "request-1",
+    );
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    let body = to_bytes(response.into_body(), 1024).await?;
+    assert!(body.is_empty());
+    Ok(())
+}
+
+#[test]
+fn detects_streaming_sigv4_payloads() {
+    let mut headers = HeaderMap::new();
+    assert!(!is_streaming_payload(&headers));
+    headers.insert(
+        "x-amz-content-sha256",
+        HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+    );
+    assert!(is_streaming_payload(&headers));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_ENCODING,
+        HeaderValue::from_static("aws-chunked, gzip"),
+    );
+    assert!(is_streaming_payload(&headers));
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    assert!(!is_streaming_payload(&headers));
+}
+
+#[test]
+fn serializes_per_key_delete_errors() -> Result<()> {
+    let xml = to_string(&super::xml::DeleteResult {
+        deleted: Some(vec![super::xml::DeletedXml {
+            key: "kept".to_string(),
+        }]),
+        errors: vec![super::xml::DeleteErrorXml {
+            key: "failed".to_string(),
+            code: "InternalError".to_string(),
+            message: "boom".to_string(),
+        }],
+    })?;
+    assert!(xml.contains("<Deleted><Key>kept</Key></Deleted>"));
+    assert!(xml.contains("<Error><Key>failed</Key><Code>InternalError</Code>"));
+    Ok(())
 }
 
 #[test]

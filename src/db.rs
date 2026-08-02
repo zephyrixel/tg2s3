@@ -56,4 +56,13 @@ impl Db {
             .fetch_one(&self.pool)
             .await?)
     }
+
+    /// Cheap readiness probe; unlike `integrity_check` it does not scan the
+    /// whole database and is safe to call at probe frequency.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
+    }
 }

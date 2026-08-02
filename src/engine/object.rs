@@ -37,7 +37,7 @@ impl Engine {
                 && expected != actual_length
             {
                 bail!(
-                    "request Content-Length {expected} does not match body length {actual_length}"
+                    "IncompleteBody: request Content-Length {expected} does not match body length {actual_length}"
                 );
             }
             let released_blocks = match self
@@ -56,20 +56,20 @@ impl Engine {
                     return Err(error);
                 }
             };
-            self.reclaim_blocks(released_blocks).await;
+            self.reclaim_blocks(released_blocks);
             let etag = part.etag.clone();
             let (object, released_blocks) = self
                 .db
                 .commit_upload(&upload_id, actual_length, &etag, &[part], &condition)
                 .await?
                 .ok_or_else(|| anyhow!("upload disappeared"))?;
-            self.reclaim_blocks(released_blocks).await;
+            self.reclaim_blocks(released_blocks);
             Ok(object)
         }
         .await;
         if result.is_err() {
             match self.db.abort_upload_with_blocks(&upload_id).await {
-                Ok(Some(blocks)) => self.reclaim_blocks(blocks).await,
+                Ok(Some(blocks)) => self.reclaim_blocks(blocks),
                 Ok(None) => {}
                 Err(error) => {
                     tracing::error!(upload_id, error = %error, "failed to abort failed object upload");
@@ -101,7 +101,7 @@ impl Engine {
         let Some(deleted) = deleted else {
             return Ok(false);
         };
-        self.reclaim_blocks(deleted.blocks).await;
+        self.reclaim_blocks(deleted.blocks);
         Ok(true)
     }
 
@@ -120,7 +120,7 @@ impl Engine {
             .db
             .copy_object(&source, bucket, key, metadata, condition)
             .await?;
-        self.reclaim_blocks(released_blocks).await;
+        self.reclaim_blocks(released_blocks);
         Ok(object)
     }
 }

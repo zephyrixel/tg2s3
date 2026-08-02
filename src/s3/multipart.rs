@@ -1,6 +1,6 @@
 use super::xml::{
-    CompleteMultipartRequest, CompleteMultipartResult, DeleteRequest, DeleteResult, DeletedXml,
-    ListMultipartUploadsResult, ListPartsResult, PartXml, UploadXml, xml_response,
+    CompleteMultipartRequest, CompleteMultipartResult, DeleteErrorXml, DeleteRequest, DeleteResult,
+    DeletedXml, ListMultipartUploadsResult, ListPartsResult, PartXml, UploadXml, xml_response,
 };
 use super::{format_time, quoted};
 use crate::engine::Engine;
@@ -93,13 +93,21 @@ pub(super) async fn multi_delete(engine: &Engine, bucket: &str, body: Body) -> R
         bail!("InvalidRequest");
     }
     let mut deleted = Vec::new();
+    let mut errors = Vec::new();
     let condition = ObjectCondition::default();
     for object in objects {
         let key = object.key;
-        let _ = engine.delete_object(bucket, &key, &condition).await?;
-        deleted.push(DeletedXml { key });
+        match engine.delete_object(bucket, &key, &condition).await {
+            Ok(_) => deleted.push(DeletedXml { key }),
+            Err(error) => {
+                let code = super::error_code(&error);
+                let message = super::public_error_message(&code, &error);
+                errors.push(DeleteErrorXml { key, code, message });
+            }
+        }
     }
     xml_response(DeleteResult {
         deleted: (!quiet).then_some(deleted),
+        errors,
     })
 }

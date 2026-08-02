@@ -150,6 +150,24 @@ impl TelegramClient {
             }
         }
     }
+
+    /// Batch deletion; both backends skip messages that no longer exist.
+    pub async fn delete_messages(
+        &self,
+        backend: TelegramBackend,
+        message_ids: &[i64],
+    ) -> Result<()> {
+        match backend {
+            TelegramBackend::BotApi => self.bot_api.delete_messages(message_ids).await,
+            TelegramBackend::Grammers => {
+                self.grammers
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("grammers backend is not initialized"))?
+                    .delete_messages(message_ids)
+                    .await
+            }
+        }
+    }
 }
 
 pub fn is_missing_message(error: &anyhow::Error) -> bool {

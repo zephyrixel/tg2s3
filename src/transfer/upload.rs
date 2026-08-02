@@ -11,7 +11,7 @@ mod tests;
 use crate::config::Config;
 use crate::db::Db;
 use crate::limits::TransferLimits;
-use crate::model::{PartRecord, TelegramBackend};
+use crate::model::{BlockRef, PartRecord, TelegramBackend};
 use crate::telegram::{StoredDocument, TelegramClient};
 use anyhow::{Result, anyhow};
 use axum::body::Body;
@@ -35,6 +35,24 @@ pub(super) struct UploadedBlock {
     pub(super) file_id: String,
     pub(super) file_unique_id: String,
     pub(super) message_date: i64,
+}
+
+impl UploadedBlock {
+    pub(super) fn to_block_ref(&self, chat_id: i64) -> BlockRef {
+        BlockRef {
+            id: self.id,
+            ordinal: self.ordinal,
+            offset: self.offset,
+            size: self.data_size,
+            chat_id,
+            message_id: self.message_id,
+            backend: self.backend,
+            document_id: self.document_id,
+            file_id: self.file_id.clone(),
+            file_unique_id: self.file_unique_id.clone(),
+            message_date: self.message_date,
+        }
+    }
 }
 
 pub(super) type UploadTask = JoinHandle<Result<UploadedBlock>>;

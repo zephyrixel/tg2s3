@@ -1,11 +1,10 @@
-use crate::model::{ListingRecord, ObjectCondition, ObjectMetadata, ObjectRecord};
+use crate::model::{ListingRecord, ObjectCondition, ObjectMetadata, ObjectRecord, key_successor};
 use anyhow::{Result, anyhow, bail};
 use sqlx::Row;
 
 use super::Db;
 use super::support::{
-    decrement_block, ensure_blocks_not_queued, escape_glob, load_object_blocks,
-    load_object_blocks_tx, now, parse_metadata,
+    ensure_blocks_not_queued, load_object_blocks, now, parse_metadata, remove_existing_object,
 };
 
 impl Db {
@@ -36,26 +35,44 @@ impl Db {
         }))
     }
 
+    /// Lists keys under `prefix` starting from the `lower` bound (`>=` when
+    /// `lower_inclusive`, `>` otherwise). Plain range comparisons keep the
+    /// query on the `(bucket, object_key)` index; the prefix constraint is the
+    /// half-open range `[prefix, key_successor(prefix))`.
     pub async fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
-        after: &str,
+        lower: &str,
+        lower_inclusive: bool,
         limit: usize,
     ) -> Result<Vec<ListingRecord>> {
-        let pattern = format!("{}*", escape_glob(prefix));
-        let rows = sqlx::query(
+        let (lower, lower_inclusive) = if lower < prefix {
+            (prefix, true)
+        } else {
+            (lower, lower_inclusive)
+        };
+        let upper = if prefix.is_empty() {
+            None
+        } else {
+            key_successor(prefix)
+        };
+        let comparison = if lower_inclusive { ">=" } else { ">" };
+        let mut sql = format!(
             "SELECT object_key, size, etag, modified_at
              FROM objects
-             WHERE bucket = ?1 AND object_key > ?2 AND object_key GLOB ?3
-             ORDER BY object_key LIMIT ?4",
-        )
-        .bind(bucket)
-        .bind(after)
-        .bind(pattern)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE bucket = ?1 AND object_key {comparison} ?2"
+        );
+        if upper.is_some() {
+            sql.push_str(" AND object_key < ?3 ORDER BY object_key LIMIT ?4");
+        } else {
+            sql.push_str(" ORDER BY object_key LIMIT ?3");
+        }
+        let mut query = sqlx::query(&sql).bind(bucket).bind(lower);
+        if let Some(upper) = &upper {
+            query = query.bind(upper);
+        }
+        let rows = query.bind(limit as i64).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
             .map(|row| ListingRecord {
@@ -74,29 +91,12 @@ impl Db {
         condition: &ObjectCondition,
     ) -> Result<Option<ObjectRecord>> {
         let mut tx = self.pool.begin().await?;
-        let object =
-            sqlx::query("SELECT id, etag FROM objects WHERE bucket = ?1 AND object_key = ?2")
-                .bind(bucket)
-                .bind(key)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let object_etag = object.as_ref().map(|row| row.get::<String, _>("etag"));
-        if !condition.allows(object_etag.as_deref()) {
-            bail!("PreconditionFailed");
-        }
-        let Some(object_id) = object else {
+        let Some((object_id, old_blocks)) =
+            remove_existing_object(&mut tx, bucket, key, condition).await?
+        else {
             tx.rollback().await?;
             return Ok(None);
         };
-        let object_id: i64 = object_id.get("id");
-        let old_blocks = load_object_blocks_tx(&mut tx, object_id).await?;
-        sqlx::query("DELETE FROM objects WHERE id = ?1")
-            .bind(object_id)
-            .execute(&mut *tx)
-            .await?;
-        for block in &old_blocks {
-            decrement_block(&mut tx, block.id).await?;
-        }
         tx.commit().await?;
         Ok(Some(ObjectRecord {
             id: object_id,
@@ -138,27 +138,10 @@ impl Db {
             .map(|block| block.id)
             .collect::<Vec<_>>();
         ensure_blocks_not_queued(&mut tx, &source_block_ids).await?;
-        let mut old_blocks = Vec::new();
-        let old = sqlx::query("SELECT id, etag FROM objects WHERE bucket = ?1 AND object_key = ?2")
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let old_etag = old.as_ref().map(|row| row.get::<String, _>("etag"));
-        if !condition.allows(old_etag.as_deref()) {
-            bail!("PreconditionFailed");
-        }
-        if let Some(old_id) = old {
-            let old_id: i64 = old_id.get("id");
-            old_blocks = load_object_blocks_tx(&mut tx, old_id).await?;
-            sqlx::query("DELETE FROM objects WHERE id = ?1")
-                .bind(old_id)
-                .execute(&mut *tx)
-                .await?;
-            for block in &old_blocks {
-                decrement_block(&mut tx, block.id).await?;
-            }
-        }
+        let old_blocks = remove_existing_object(&mut tx, bucket, key, condition)
+            .await?
+            .map(|(_, blocks)| blocks)
+            .unwrap_or_default();
         let timestamp = now();
         let object_row = sqlx::query(
             "INSERT INTO objects

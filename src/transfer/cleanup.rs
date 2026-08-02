@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) fn references_for_uploaded(chat_id: i64, uploaded: &[UploadedBlock]) -> Vec<BlockRef> {
     uploaded
         .iter()
-        .map(|block| to_reference(chat_id, block))
+        .map(|block| block.to_block_ref(chat_id))
         .collect()
 }
 
@@ -148,22 +148,6 @@ pub(crate) async fn cleanup_block_refs(
 ) {
     for reference in references {
         cleanup_untracked_block(db, telegram, reference).await;
-    }
-}
-
-fn to_reference(chat_id: i64, block: &UploadedBlock) -> BlockRef {
-    BlockRef {
-        id: block.id,
-        ordinal: block.ordinal,
-        offset: block.offset,
-        size: block.data_size,
-        chat_id,
-        message_id: block.message_id,
-        backend: block.backend,
-        document_id: block.document_id,
-        file_id: block.file_id.clone(),
-        file_unique_id: block.file_unique_id.clone(),
-        message_date: block.message_date,
     }
 }
 

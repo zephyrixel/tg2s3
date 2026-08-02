@@ -102,10 +102,9 @@ impl BandwidthLimiter {
             TransferDirection::Upload => (self.upload_rate, self.global_upload.clone()),
             TransferDirection::Download => (self.download_rate, self.global_download.clone()),
         };
-        let wait = reserve(&schedule, rate, bytes);
-        if bounded && wait > self.wait {
+        let Some(wait) = reserve(&schedule, rate, bytes, bounded.then_some(self.wait)) else {
             bail!(LimitError::SlowDown);
-        }
+        };
         if !wait.is_zero() {
             sleep(wait).await;
         }
@@ -113,18 +112,32 @@ impl BandwidthLimiter {
     }
 }
 
-fn reserve(schedule: &Arc<Mutex<RateSchedule>>, rate: u64, bytes: usize) -> Duration {
+/// Reserves `bytes` of bandwidth and returns how long the caller must wait, or
+/// `None` when the wait would exceed `max_wait`. A rejected reservation is not
+/// committed, so refused transfers do not consume budget.
+fn reserve(
+    schedule: &Arc<Mutex<RateSchedule>>,
+    rate: u64,
+    bytes: usize,
+    max_wait: Option<Duration>,
+) -> Option<Duration> {
     if rate == 0 {
-        return Duration::ZERO;
+        return Some(Duration::ZERO);
     }
     let duration = Duration::from_secs_f64(bytes as f64 / rate as f64);
     let now = Instant::now();
     let Ok(mut state) = schedule.lock() else {
-        return duration;
+        return Some(duration);
     };
     let start = state.next.unwrap_or(now).max(now);
+    let wait = start.saturating_duration_since(now);
+    if let Some(max_wait) = max_wait
+        && wait > max_wait
+    {
+        return None;
+    }
     state.next = Some(start + duration);
-    start.saturating_duration_since(now)
+    Some(wait)
 }
 
 pub fn check_size(length: Option<i64>, max_size: i64) -> Result<()> {
@@ -168,5 +181,22 @@ mod tests {
         );
         assert!(check_size(Some(-1), 10).is_err());
         assert!(check_size(None, 10).is_ok());
+    }
+
+    #[test]
+    fn rejected_reservations_do_not_consume_bandwidth_budget() {
+        let schedule = Arc::new(Mutex::new(RateSchedule::default()));
+        // 1000 B/s: the first reservation fills one second of budget.
+        assert_eq!(
+            reserve(&schedule, 1000, 1000, Some(Duration::from_secs(5))),
+            Some(Duration::ZERO)
+        );
+        // A huge request would need to wait ~1s, above its 0s bound: rejected.
+        assert_eq!(reserve(&schedule, 1000, 10_000, Some(Duration::ZERO)), None);
+        // The rejected request must not have advanced the schedule: a request
+        // with a 2s bound still only waits the original ~1s.
+        let wait = reserve(&schedule, 1000, 1000, Some(Duration::from_secs(2)))
+            .expect("reservation within bound");
+        assert!(wait <= Duration::from_secs(1) + Duration::from_millis(50));
     }
 }

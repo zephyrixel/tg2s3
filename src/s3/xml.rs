@@ -274,12 +274,24 @@ pub(super) struct UploadXml {
 pub(super) struct DeleteResult {
     #[serde(rename = "Deleted", skip_serializing_if = "Option::is_none")]
     pub(super) deleted: Option<Vec<DeletedXml>>,
+    #[serde(rename = "Error", skip_serializing_if = "Vec::is_empty")]
+    pub(super) errors: Vec<DeleteErrorXml>,
 }
 
 #[derive(Serialize)]
 pub(super) struct DeletedXml {
     #[serde(rename = "Key")]
     pub(super) key: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct DeleteErrorXml {
+    #[serde(rename = "Key")]
+    pub(super) key: String,
+    #[serde(rename = "Code")]
+    pub(super) code: String,
+    #[serde(rename = "Message")]
+    pub(super) message: String,
 }
 
 #[derive(Serialize)]

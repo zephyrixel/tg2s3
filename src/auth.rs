@@ -219,12 +219,19 @@ fn canonical_headers(headers: &HeaderMap, signed_headers: &str) -> Result<String
         if name.is_empty() {
             continue;
         }
-        let value = headers
-            .get(name.as_str())
-            .ok_or_else(|| anyhow!("Signed header missing"))?
-            .to_str()
-            .map_err(|_| anyhow!("Invalid signed header"))?;
-        result.push(format!("{}:{}", name, collapse_spaces(value)));
+        // SigV4 joins repeated header values with commas.
+        let mut values = Vec::new();
+        for value in headers.get_all(name.as_str()) {
+            values.push(collapse_spaces(
+                value
+                    .to_str()
+                    .map_err(|_| anyhow!("Invalid signed header"))?,
+            ));
+        }
+        if values.is_empty() {
+            return Err(anyhow!("Signed header missing"));
+        }
+        result.push(format!("{}:{}", name, values.join(",")));
     }
     Ok(result.join("\n"))
 }

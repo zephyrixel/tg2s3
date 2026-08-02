@@ -23,51 +23,118 @@ impl Engine {
             return Ok(processed);
         }
         let candidates = self.db.gc_candidates(timestamp, remaining).await?;
-        for candidate in candidates {
-            self.process_gc_candidate(candidate, timestamp).await?;
-            processed += 1;
-        }
+        processed += self.process_gc_candidates(candidates, timestamp).await?;
         Ok(processed)
     }
 
-    pub(super) async fn reclaim_blocks(&self, blocks: Vec<BlockRef>) {
+    /// Schedules released blocks for immediate best-effort Telegram cleanup in
+    /// the background. The gc_queue rows written by the releasing transaction
+    /// guarantee a retry through `run_gc` if this task never completes, so the
+    /// caller does not have to wait for Telegram.
+    pub(super) fn reclaim_blocks(&self, blocks: Vec<BlockRef>) {
         if blocks.is_empty() {
             return;
         }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            engine.reclaim_blocks_now(blocks).await;
+        });
+    }
+
+    async fn reclaim_blocks_now(&self, blocks: Vec<BlockRef>) {
         let _gc_guard = self.gc_lock.lock().await;
         let timestamp = now();
+        let mut candidates = Vec::with_capacity(blocks.len());
         for block in blocks {
-            let candidate = match self.db.gc_candidate(block.id, timestamp).await {
-                Ok(candidate) => candidate,
+            match self.db.gc_candidate(block.id, timestamp).await {
+                Ok(Some(candidate)) => candidates.push(candidate),
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
                         block_id = block.id,
                         error = %error,
                         "failed to load released Telegram block for immediate cleanup"
                     );
-                    continue;
                 }
-            };
-            let Some(candidate) = candidate else {
-                continue;
-            };
-            if let Err(error) = self.process_gc_candidate(candidate, timestamp).await {
-                tracing::warn!(
-                    block_id = block.id,
-                    error = %error,
-                    "failed to immediately clean up released Telegram block"
-                );
             }
+        }
+        if let Err(error) = self.process_gc_candidates(candidates, timestamp).await {
+            tracing::warn!(
+                error = %error,
+                "failed to immediately clean up released Telegram blocks"
+            );
         }
     }
 
-    async fn process_gc_candidate(&self, candidate: GarbageRecord, timestamp: i64) -> Result<()> {
-        if bot_api_delete_window_expired(candidate.backend, candidate.message_date, timestamp) {
-            self.db
-                .gc_orphan(candidate.block_id, "Telegram deleteMessage 48 hour limit")
-                .await?;
-            return Ok(());
+    /// Marks expired Bot API candidates as orphans, then deletes the rest in
+    /// per-backend batches, falling back to per-message deletion when a batch
+    /// call fails (for example against an older local Bot API server).
+    async fn process_gc_candidates(
+        &self,
+        candidates: Vec<GarbageRecord>,
+        timestamp: i64,
+    ) -> Result<usize> {
+        let mut processed = 0;
+        let mut groups: Vec<(TelegramBackend, Vec<GarbageRecord>)> = Vec::new();
+        for candidate in candidates {
+            if bot_api_delete_window_expired(candidate.backend, candidate.message_date, timestamp) {
+                self.db
+                    .gc_orphan(candidate.block_id, "Telegram deleteMessage 48 hour limit")
+                    .await?;
+                processed += 1;
+                continue;
+            }
+            match groups
+                .iter_mut()
+                .find(|(backend, _)| *backend == candidate.backend)
+            {
+                Some((_, group)) => group.push(candidate),
+                None => groups.push((candidate.backend, vec![candidate])),
+            }
         }
+        for (backend, group) in groups {
+            processed += self
+                .delete_candidate_group(backend, group, timestamp)
+                .await?;
+        }
+        Ok(processed)
+    }
+
+    async fn delete_candidate_group(
+        &self,
+        backend: TelegramBackend,
+        group: Vec<GarbageRecord>,
+        timestamp: i64,
+    ) -> Result<usize> {
+        if group.len() > 1 {
+            let message_ids: Vec<i64> = group.iter().map(|record| record.message_id).collect();
+            match self.telegram.delete_messages(backend, &message_ids).await {
+                Ok(()) => {
+                    let mut processed = 0;
+                    for candidate in group {
+                        self.db.gc_success(candidate.block_id).await?;
+                        processed += 1;
+                    }
+                    return Ok(processed);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        count = message_ids.len(),
+                        error = %error,
+                        "batch Telegram message deletion failed; retrying per message"
+                    );
+                }
+            }
+        }
+        let mut processed = 0;
+        for candidate in group {
+            self.process_gc_candidate(candidate, timestamp).await?;
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
+    async fn process_gc_candidate(&self, candidate: GarbageRecord, timestamp: i64) -> Result<()> {
         let block = candidate.as_block_ref();
         match self.telegram.delete_message(&block).await {
             Ok(()) => self.db.gc_success(candidate.block_id).await?,

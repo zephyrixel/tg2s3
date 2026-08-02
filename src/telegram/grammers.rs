@@ -255,6 +255,22 @@ impl GrammersClient {
         }
         Ok(())
     }
+
+    /// Deletes messages in batches of up to 100; already-deleted messages are
+    /// skipped without failing the batch.
+    pub async fn delete_messages(&self, message_ids: &[i64]) -> Result<()> {
+        for chunk in message_ids.chunks(100) {
+            let ids = chunk
+                .iter()
+                .map(|id| i32::try_from(*id).context("Telegram message ID is too large"))
+                .collect::<Result<Vec<_>>>()?;
+            self.client
+                .delete_messages(self.peer, &ids)
+                .await
+                .map_err(invocation_error)?;
+        }
+        Ok(())
+    }
 }
 
 async fn resolve_storage_peer(client: &Client, config: &Config) -> Result<PeerRef> {

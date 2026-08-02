@@ -86,6 +86,20 @@ async fn mock_telegram(State(state): State<MockState>, request: Request<Body>) -
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         return json_response(r#"{"ok":true,"result":true}"#);
     }
+    if path.ends_with("/deleteMessages") {
+        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let form: HashMap<String, String> =
+            url::form_urlencoded::parse(&bytes).into_owned().collect();
+        let ids: Vec<i64> =
+            serde_json::from_str(form.get("message_ids").map(String::as_str).unwrap_or("[]"))
+                .unwrap();
+        state
+            .delete_count
+            .fetch_add(ids.len(), std::sync::atomic::Ordering::SeqCst);
+        return json_response(r#"{"ok":true,"result":true}"#);
+    }
     if path.contains("/file/bot") {
         let file_id = path.rsplit('/').next().unwrap_or_default();
         let Some(data) = state.files.lock().unwrap().get(file_id).cloned() else {
@@ -108,6 +122,26 @@ async fn mock_telegram(State(state): State<MockState>, request: Request<Body>) -
         return response;
     }
     status_response(StatusCode::NOT_FOUND)
+}
+
+/// Released blocks are reclaimed by a background task; poll until the mock has
+/// observed the expected number of Telegram deletions.
+async fn wait_for_deletes(
+    counter: &Arc<std::sync::atomic::AtomicUsize>,
+    expected: usize,
+) -> Result<()> {
+    for _ in 0..200 {
+        if counter.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let value = counter.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(
+        value == expected,
+        "expected {expected} Telegram deletions, observed {value}"
+    );
+    Ok(())
 }
 
 fn json_response(body: &str) -> Response {
@@ -377,6 +411,24 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
     let response = client.put(&endpoint).body("abcdef").send().await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
+    // aws-chunked streaming payloads carry chunk framing and must be rejected
+    // instead of stored verbatim.
+    let streaming = client
+        .put(format!("http://{s3_address}/bucket/streaming-reject"))
+        .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+        .body("chunk-framing")
+        .send()
+        .await?;
+    assert_eq!(streaming.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        client
+            .get(format!("http://{s3_address}/bucket/streaming-reject"))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
     let delete_count_before_failed_replace = delete_count.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         engine
@@ -394,10 +446,7 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
             .await
             .is_err()
     );
-    assert_eq!(
-        delete_count.load(std::sync::atomic::Ordering::SeqCst),
-        delete_count_before_failed_replace + 1
-    );
+    wait_for_deletes(&delete_count, delete_count_before_failed_replace + 1).await?;
 
     let response = client
         .put(&endpoint)
@@ -462,6 +511,80 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
     assert!(!second_page.contains("<Prefix>aaa/</Prefix>"));
     assert!(second_page.contains("<Key>copied</Key>"));
 
+    // Delimiter listings must seek past collapsed prefixes and resume without
+    // re-emitting groups already returned on earlier pages.
+    for key in ["lst/a/1", "lst/a/2", "lst/b/1", "lst/c"] {
+        assert_eq!(
+            client
+                .put(format!("http://{s3_address}/bucket/{key}"))
+                .body("x")
+                .send()
+                .await?
+                .status(),
+            reqwest::StatusCode::OK
+        );
+    }
+    let grouped_page = client
+        .get(format!(
+            "http://{s3_address}/bucket?list-type=2&prefix=lst%2F&delimiter=%2F&max-keys=2"
+        ))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(grouped_page.contains("<Prefix>lst/a/</Prefix>"));
+    assert!(grouped_page.contains("<Prefix>lst/b/</Prefix>"));
+    assert!(grouped_page.contains("<IsTruncated>true</IsTruncated>"));
+    let grouped_token = grouped_page
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|value| value.split("</NextContinuationToken>").next())
+        .ok_or_else(|| anyhow!("missing grouped continuation token"))?;
+    let grouped_second = client
+        .get(format!(
+            "http://{s3_address}/bucket?list-type=2&prefix=lst%2F&delimiter=%2F&max-keys=2&continuation-token={grouped_token}"
+        ))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(!grouped_second.contains("<CommonPrefixes>"));
+    assert!(grouped_second.contains("<Key>lst/c</Key>"));
+    assert!(grouped_second.contains("<IsTruncated>false</IsTruncated>"));
+    // The v1 flow resumes from NextMarker with the same semantics.
+    let v1_page = client
+        .get(format!(
+            "http://{s3_address}/bucket?prefix=lst%2F&delimiter=%2F&max-keys=2"
+        ))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(v1_page.contains("<NextMarker>lst/b/</NextMarker>"));
+    let v1_second = client
+        .get(format!(
+            "http://{s3_address}/bucket?prefix=lst%2F&delimiter=%2F&max-keys=2&marker=lst%2Fb%2F"
+        ))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(!v1_second.contains("<Prefix>lst/b/</Prefix>"));
+    assert!(v1_second.contains("<Key>lst/c</Key>"));
+    let delete_count_before_lst_cleanup = delete_count.load(std::sync::atomic::Ordering::SeqCst);
+    for key in ["lst/a/1", "lst/a/2", "lst/b/1", "lst/c"] {
+        assert_eq!(
+            client
+                .delete(format!("http://{s3_address}/bucket/{key}"))
+                .send()
+                .await?
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+    }
+    wait_for_deletes(&delete_count, delete_count_before_lst_cleanup + 4).await?;
+
+    let delete_count_before_quiet_delete = delete_count.load(std::sync::atomic::Ordering::SeqCst);
     let quiet_delete = client
         .post(format!("http://{s3_address}/bucket?delete"))
         .body("<Delete><Quiet>true</Quiet><Object><Key>aaa/a</Key></Object></Delete>")
@@ -469,6 +592,7 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
         .await?;
     assert_eq!(quiet_delete.status(), reqwest::StatusCode::OK);
     assert!(!quiet_delete.text().await?.contains("<Deleted>"));
+    wait_for_deletes(&delete_count, delete_count_before_quiet_delete + 1).await?;
     let missing_bucket_delete = client
         .post(format!("http://{s3_address}/missing?delete"))
         .body("<Delete><Object><Key>key</Key></Object></Delete>")
@@ -520,6 +644,9 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
         client.delete(&endpoint).send().await?.status(),
         reqwest::StatusCode::NO_CONTENT
     );
+    // The object's blocks are still referenced by "copied": give the background
+    // reclaim task time to run, then verify it deleted nothing.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
         delete_count.load(std::sync::atomic::Ordering::SeqCst),
         delete_count_before_object_delete
@@ -550,6 +677,32 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
         .get("etag")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("missing part etag"))?;
+    // Upload a second part that the completion below does not reference: S3
+    // allows completing with a subset, and the unused part must be reclaimed.
+    assert_eq!(
+        client
+            .put(format!(
+                "{multipart_base}?partNumber=2&uploadId={upload_id}"
+            ))
+            .body("extra-part")
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let delete_count_before_complete = delete_count.load(std::sync::atomic::Ordering::SeqCst);
+    // UploadPartCopy is unsupported and must not silently create a part.
+    assert_eq!(
+        client
+            .put(format!(
+                "{multipart_base}?partNumber=3&uploadId={upload_id}"
+            ))
+            .header("x-amz-copy-source", "/bucket/file")
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NOT_IMPLEMENTED
+    );
     let complete_xml = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{part_etag}</ETag></Part></CompleteMultipartUpload>"
     );
@@ -564,6 +717,8 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
         client.get(&multipart_base).send().await?.bytes().await?,
         Bytes::from_static(b"part-data")
     );
+    // "extra-part" spans two 8-byte chunks; both blocks must be deleted.
+    wait_for_deletes(&delete_count, delete_count_before_complete + 2).await?;
 
     let mutable_base = format!("http://{s3_address}/bucket/mutable");
     let initiate = client
@@ -602,10 +757,7 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
             .status(),
         reqwest::StatusCode::OK
     );
-    assert_eq!(
-        delete_count.load(std::sync::atomic::Ordering::SeqCst),
-        delete_count_before_part_replace + 1
-    );
+    wait_for_deletes(&delete_count, delete_count_before_part_replace + 1).await?;
     let delete_count_before_abort = delete_count.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         client
@@ -615,10 +767,7 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
             .status(),
         reqwest::StatusCode::NO_CONTENT
     );
-    assert_eq!(
-        delete_count.load(std::sync::atomic::Ordering::SeqCst),
-        delete_count_before_abort + 1
-    );
+    wait_for_deletes(&delete_count, delete_count_before_abort + 1).await?;
 
     let delete_count_before_shared_copy_delete =
         delete_count.load(std::sync::atomic::Ordering::SeqCst);
@@ -630,9 +779,6 @@ async fn puts_and_reads_ranges_through_telegram() -> Result<()> {
             .status(),
         reqwest::StatusCode::NO_CONTENT
     );
-    assert_eq!(
-        delete_count.load(std::sync::atomic::Ordering::SeqCst),
-        delete_count_before_shared_copy_delete + 1
-    );
+    wait_for_deletes(&delete_count, delete_count_before_shared_copy_delete + 1).await?;
     Ok(())
 }

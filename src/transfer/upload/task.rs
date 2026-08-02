@@ -1,5 +1,5 @@
 use super::{BlockSpec, UploadContext, UploadTask, UploadedBlock, uploaded_block};
-use crate::model::{BlockRef, TelegramBackend};
+use crate::model::TelegramBackend;
 use crate::telegram::{StoredDocument, UploadReader};
 use anyhow::{Result, anyhow, bail};
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -180,19 +180,7 @@ async fn upload_one(
         );
     }
     let mut block = uploaded_block(spec.ordinal, spec.offset, spec.size as i64, document);
-    let reference = BlockRef {
-        id: 0,
-        ordinal: block.ordinal,
-        offset: block.offset,
-        size: block.data_size,
-        chat_id: context.config.chat_id,
-        message_id: block.message_id,
-        backend: block.backend,
-        document_id: block.document_id,
-        file_id: block.file_id.clone(),
-        file_unique_id: block.file_unique_id.clone(),
-        message_date: block.message_date,
-    };
+    let reference = block.to_block_ref(context.config.chat_id);
     block.id = match context.db.add_staged_block(&reference).await {
         Ok(id) => id,
         Err(error) => {
@@ -200,19 +188,9 @@ async fn upload_one(
             return Err(error);
         }
     };
-    context.cleanup.register(BlockRef {
-        id: block.id,
-        ordinal: block.ordinal,
-        offset: block.offset,
-        size: block.data_size,
-        chat_id: context.config.chat_id,
-        message_id: block.message_id,
-        backend: block.backend,
-        document_id: block.document_id,
-        file_id: block.file_id.clone(),
-        file_unique_id: block.file_unique_id.clone(),
-        message_date: block.message_date,
-    });
+    context
+        .cleanup
+        .register(block.to_block_ref(context.config.chat_id));
     message_cleanup.disarm();
     Ok(block)
 }

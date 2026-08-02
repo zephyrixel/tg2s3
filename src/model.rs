@@ -61,6 +61,26 @@ pub fn normalize_etag(value: &str) -> String {
     value.trim().trim_matches('"').to_string()
 }
 
+/// Returns the smallest valid UTF-8 string that is greater than every string
+/// starting with `value`, or `None` when no such string exists. Rust string
+/// ordering matches SQLite BINARY collation (both compare UTF-8 bytes), so the
+/// result can seek listing queries past an entire key prefix.
+pub fn key_successor(value: &str) -> Option<String> {
+    let mut characters: Vec<char> = value.chars().collect();
+    while let Some(last) = characters.pop() {
+        let mut next = last as u32 + 1;
+        if (0xD800..=0xDFFF).contains(&next) {
+            next = 0xE000;
+        }
+        if let Some(character) = char::from_u32(next) {
+            characters.push(character);
+            return Some(characters.into_iter().collect());
+        }
+        // `last` was char::MAX: carry into the previous character.
+    }
+    None
+}
+
 fn etag_matches(value: &str, etag: Option<&str>) -> bool {
     let Some(etag) = etag else {
         return false;
@@ -192,6 +212,25 @@ mod tests {
         };
         assert!(condition.allows(None));
         assert!(!condition.allows(Some("one")));
+    }
+
+    #[test]
+    fn key_successor_bounds_every_prefixed_key() {
+        assert_eq!(key_successor("aaa/").as_deref(), Some("aaa0"));
+        assert_eq!(key_successor("a").as_deref(), Some("b"));
+        // Successor of a surrogate-boundary character skips the surrogate gap.
+        assert_eq!(key_successor("\u{D7FF}").as_deref(), Some("\u{E000}"));
+        // char::MAX carries into the previous character.
+        assert_eq!(
+            key_successor(&format!("a{}", char::MAX)).as_deref(),
+            Some("b")
+        );
+        assert_eq!(key_successor(&char::MAX.to_string()), None);
+        assert_eq!(key_successor(""), None);
+        for (prefix, key) in [("aaa/", "aaa/zzz"), ("aaa/", "aaa/\u{10FFFF}")] {
+            let bound = key_successor(prefix).expect("prefix has a successor");
+            assert!(key > prefix && *key < *bound);
+        }
     }
 }
 

@@ -6,6 +6,7 @@ use crate::model::{
 use anyhow::{Result, anyhow, bail};
 use axum::body::Body;
 use md5::{Digest, Md5};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 impl Engine {
@@ -64,7 +65,7 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.reclaim_blocks(released_blocks).await;
+        self.reclaim_blocks(released_blocks);
         Ok(PartRecord {
             upload_id: upload_id.to_string(),
             part_number,
@@ -96,17 +97,20 @@ impl Engine {
             }
         }
         let stored = self.db.get_parts(upload_id, false).await?;
-        if stored.len() != requested.len() {
-            bail!("InvalidPart");
-        }
+        // S3 allows completing with a subset of the uploaded parts; unused
+        // parts are released by the commit transaction.
+        let mut stored_by_number: HashMap<i32, PartRecord> = stored
+            .into_iter()
+            .map(|part| (part.part_number, part))
+            .collect();
         let mut ordered = Vec::with_capacity(requested.len());
         let mut total_size = 0_i64;
         let mut composite = Md5::new();
         for (index, (part_number, requested_etag)) in requested.iter().enumerate() {
-            let part = stored.get(index).ok_or_else(|| anyhow!("InvalidPart"))?;
-            if part.part_number != *part_number
-                || normalize_etag(&part.etag) != normalize_etag(requested_etag)
-            {
+            let part = stored_by_number
+                .remove(part_number)
+                .ok_or_else(|| anyhow!("InvalidPart"))?;
+            if normalize_etag(&part.etag) != normalize_etag(requested_etag) {
                 bail!("InvalidPart");
             }
             if index + 1 != requested.len() && part.size < MIN_MULTIPART_PART {
@@ -124,7 +128,7 @@ impl Engine {
             if total_size > self.config.max_object_size {
                 bail!("EntityTooLarge");
             }
-            ordered.push(part.clone());
+            ordered.push(part);
         }
         let etag = format!("{:x}-{}", composite.finalize(), requested.len());
         let (object, released_blocks) = self
@@ -138,7 +142,7 @@ impl Engine {
             )
             .await?
             .ok_or_else(|| anyhow!("NoSuchUpload"))?;
-        self.reclaim_blocks(released_blocks).await;
+        self.reclaim_blocks(released_blocks);
         Ok(object)
     }
 
@@ -159,7 +163,7 @@ impl Engine {
         let Some(released_blocks) = released_blocks else {
             return Ok(false);
         };
-        self.reclaim_blocks(released_blocks).await;
+        self.reclaim_blocks(released_blocks);
         Ok(true)
     }
 }

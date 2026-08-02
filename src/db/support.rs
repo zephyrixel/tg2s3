@@ -1,5 +1,6 @@
 use crate::model::{
-    BlockRef, ObjectMetadata, PartRecord, TelegramBackend, UploadRecord, normalize_etag,
+    BlockRef, ObjectCondition, ObjectMetadata, PartRecord, TelegramBackend, UploadRecord,
+    normalize_etag,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use sqlx::sqlite::SqliteRow;
@@ -16,20 +17,6 @@ pub(super) fn now() -> i64 {
 
 pub(super) fn parse_metadata(value: &str) -> Result<ObjectMetadata> {
     serde_json::from_str(value).context("decode stored metadata")
-}
-
-pub(super) fn escape_glob(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '*' => escaped.push_str("[*]"),
-            '?' => escaped.push_str("[?]"),
-            '[' => escaped.push_str("[[]"),
-            ']' => escaped.push_str("[]]"),
-            character => escaped.push(character),
-        }
-    }
-    escaped
 }
 
 pub(super) fn upload_from_row(row: SqliteRow) -> Result<UploadRecord> {
@@ -146,6 +133,39 @@ pub(super) async fn decrement_block(tx: &mut Transaction<'_, Sqlite>, block_id: 
     Ok(())
 }
 
+/// Deletes the object at `(bucket, key)` if it exists after checking
+/// `condition` against its ETag, decrementing its block references. Returns
+/// `None` when no such object exists.
+pub(super) async fn remove_existing_object(
+    tx: &mut Transaction<'_, Sqlite>,
+    bucket: &str,
+    key: &str,
+    condition: &ObjectCondition,
+) -> Result<Option<(i64, Vec<BlockRef>)>> {
+    let old = sqlx::query("SELECT id, etag FROM objects WHERE bucket = ?1 AND object_key = ?2")
+        .bind(bucket)
+        .bind(key)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let old_etag = old.as_ref().map(|row| row.get::<String, _>("etag"));
+    if !condition.allows(old_etag.as_deref()) {
+        bail!("PreconditionFailed");
+    }
+    let Some(row) = old else {
+        return Ok(None);
+    };
+    let object_id: i64 = row.get("id");
+    let old_blocks = load_object_blocks_tx(tx, object_id).await?;
+    sqlx::query("DELETE FROM objects WHERE id = ?1")
+        .bind(object_id)
+        .execute(&mut **tx)
+        .await?;
+    for block in &old_blocks {
+        decrement_block(tx, block.id).await?;
+    }
+    Ok(Some((object_id, old_blocks)))
+}
+
 // A writer must not resurrect a block after GC has claimed it.
 pub(super) async fn ensure_blocks_not_queued(
     tx: &mut Transaction<'_, Sqlite>,
@@ -167,6 +187,9 @@ pub(super) async fn ensure_blocks_not_queued(
     Ok(())
 }
 
+/// Verifies that every part in `parts` still matches the persisted upload
+/// state. Persisted parts absent from `parts` are allowed: S3 permits
+/// completing a multipart upload with a subset of the uploaded parts.
 pub(super) async fn verify_parts_tx(
     tx: &mut Transaction<'_, Sqlite>,
     upload_id: &str,
@@ -179,15 +202,10 @@ pub(super) async fn verify_parts_tx(
     .bind(upload_id)
     .fetch_all(&mut **tx)
     .await?;
-    let mut expected = HashMap::with_capacity(parts.len());
-    for part in parts {
-        if expected.insert(part.part_number, part).is_some() {
-            bail!("InvalidPart");
-        }
-    }
-    if rows.len() != expected.len() {
-        bail!("InvalidPart");
-    }
+    let mut persisted: HashMap<i32, (i64, String)> = rows
+        .into_iter()
+        .map(|row| (row.get("part_number"), (row.get("size"), row.get("etag"))))
+        .collect();
 
     let block_rows = sqlx::query(
         "SELECT part_number, ordinal, block_id, byte_offset, size
@@ -205,17 +223,20 @@ pub(super) async fn verify_parts_tx(
             .push((row.get("block_id"), row.get("byte_offset"), row.get("size")));
     }
 
-    for row in rows {
-        let part_number: i32 = row.get("part_number");
-        let Some(part) = expected.remove(&part_number) else {
+    let mut seen = HashSet::with_capacity(parts.len());
+    for part in parts {
+        if !seen.insert(part.part_number) {
+            bail!("InvalidPart");
+        }
+        let Some((size, etag)) = persisted.remove(&part.part_number) else {
             bail!("InvalidPart");
         };
-        let size: i64 = row.get("size");
-        let etag: String = row.get("etag");
         if size != part.size || normalize_etag(&etag) != normalize_etag(&part.etag) {
             bail!("InvalidPart");
         }
-        let actual = persisted_blocks.remove(&part_number).unwrap_or_default();
+        let actual = persisted_blocks
+            .remove(&part.part_number)
+            .unwrap_or_default();
         if actual.len() != part.blocks.len()
             || actual
                 .iter()
@@ -226,9 +247,6 @@ pub(super) async fn verify_parts_tx(
         {
             bail!("InvalidPart");
         }
-    }
-    if !expected.is_empty() || !persisted_blocks.is_empty() {
-        bail!("InvalidPart");
     }
     Ok(())
 }

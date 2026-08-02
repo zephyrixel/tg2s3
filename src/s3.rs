@@ -56,12 +56,8 @@ async fn healthz() -> Response {
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
-    match state.engine.db.integrity_check().await {
-        Ok(result) if result == "ok" => empty_response(StatusCode::OK),
-        Ok(result) => Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from(format!("SQLite integrity check: {result}")))
-            .unwrap_or_else(|_| empty_response(StatusCode::SERVICE_UNAVAILABLE)),
+    match state.engine.db.ping().await {
+        Ok(()) => empty_response(StatusCode::OK),
         Err(error) => Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from(format!("database unavailable: {error}")))
@@ -149,6 +145,18 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
         host = ?request_headers.get(header::HOST).and_then(|value| value.to_str().ok()),
         "S3 request received"
     );
+    if parts.method != Method::OPTIONS && is_streaming_payload(&parts.headers) {
+        // aws-chunked bodies carry chunk framing and chunk signatures; storing
+        // them verbatim would corrupt the object, so reject them up front.
+        let response = error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented".to_string(),
+            "aws-chunked streaming payloads are not supported; retry with a non-streaming payload",
+            &request_uri,
+            &request_id,
+        );
+        return apply_cors(&state, &request_uri, &request_headers, response).await;
+    }
     let request_method = parts.method.clone();
     let response = match dispatch(&state, parts.method, parts.uri, parts.headers, body).await {
         Ok(response) => response,
@@ -330,6 +338,11 @@ async fn dispatch_object(request: ObjectRequest<'_>) -> Result<Response> {
         return match method {
             Method::GET => list_parts(&state.engine, upload_id).await,
             Method::PUT => {
+                if headers.contains_key("x-amz-copy-source") {
+                    // UploadPartCopy has no request body; treating it as a
+                    // regular part upload would store an empty part.
+                    return Err(anyhow!("NotImplemented"));
+                }
                 let part_number = query_value(query, "partNumber")
                     .ok_or_else(|| anyhow!("InvalidArgument"))?
                     .parse::<i32>()
@@ -816,54 +829,50 @@ fn empty_response(status: StatusCode) -> Response {
     response
 }
 
+/// One row per S3 error code: substring matched against error text and the HTTP
+/// status it maps to. A code that is a substring of another (InvalidPart vs
+/// InvalidPartOrder) must be listed after the longer one.
+const S3_ERRORS: &[(&str, StatusCode)] = &[
+    ("NoSuchKey", StatusCode::NOT_FOUND),
+    ("NoSuchBucket", StatusCode::NOT_FOUND),
+    ("NoSuchUpload", StatusCode::NOT_FOUND),
+    ("EntityTooLarge", StatusCode::PAYLOAD_TOO_LARGE),
+    ("SlowDown", StatusCode::SERVICE_UNAVAILABLE),
+    ("PreconditionFailed", StatusCode::PRECONDITION_FAILED),
+    ("NotModified", StatusCode::NOT_MODIFIED),
+    ("BucketNotEmpty", StatusCode::CONFLICT),
+    ("EntityTooSmall", StatusCode::BAD_REQUEST),
+    ("IncompleteBody", StatusCode::BAD_REQUEST),
+    ("InvalidPartOrder", StatusCode::BAD_REQUEST),
+    ("InvalidPart", StatusCode::BAD_REQUEST),
+    ("InvalidRequest", StatusCode::BAD_REQUEST),
+    ("InvalidRange", StatusCode::RANGE_NOT_SATISFIABLE),
+    ("InvalidArgument", StatusCode::BAD_REQUEST),
+    ("InvalidBucketName", StatusCode::BAD_REQUEST),
+    ("MalformedXML", StatusCode::BAD_REQUEST),
+    ("NotImplemented", StatusCode::NOT_IMPLEMENTED),
+    ("MethodNotAllowed", StatusCode::METHOD_NOT_ALLOWED),
+    ("AccessDenied", StatusCode::FORBIDDEN),
+    ("SignatureDoesNotMatch", StatusCode::FORBIDDEN),
+    ("RequestTimeTooSkewed", StatusCode::FORBIDDEN),
+];
+
 fn status_for(error: &anyhow::Error) -> StatusCode {
-    match error_code(error).as_str() {
-        "NoSuchKey" | "NoSuchBucket" | "NoSuchUpload" => StatusCode::NOT_FOUND,
-        "PreconditionFailed" => StatusCode::PRECONDITION_FAILED,
-        "NotModified" => StatusCode::NOT_MODIFIED,
-        "BucketNotEmpty" => StatusCode::CONFLICT,
-        "EntityTooLarge" => StatusCode::PAYLOAD_TOO_LARGE,
-        "SlowDown" => StatusCode::SERVICE_UNAVAILABLE,
-        "InvalidRequest" | "EntityTooSmall" | "InvalidPart" | "InvalidPartOrder"
-        | "InvalidArgument" | "InvalidBucketName" | "MalformedXML" => StatusCode::BAD_REQUEST,
-        "MethodNotAllowed" => StatusCode::METHOD_NOT_ALLOWED,
-        "NotImplemented" => StatusCode::NOT_IMPLEMENTED,
-        "InvalidRange" => StatusCode::RANGE_NOT_SATISFIABLE,
-        "AccessDenied" | "SignatureDoesNotMatch" | "RequestTimeTooSkewed" => StatusCode::FORBIDDEN,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
+    let text = error.to_string();
+    S3_ERRORS
+        .iter()
+        .find(|(code, _)| text.contains(code))
+        .map(|(_, status)| *status)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn error_code(error: &anyhow::Error) -> String {
     let text = error.to_string();
-    for code in [
-        "NoSuchKey",
-        "NoSuchBucket",
-        "NoSuchUpload",
-        "EntityTooLarge",
-        "SlowDown",
-        "PreconditionFailed",
-        "NotModified",
-        "BucketNotEmpty",
-        "EntityTooSmall",
-        "InvalidPartOrder",
-        "InvalidPart",
-        "InvalidRequest",
-        "InvalidRange",
-        "InvalidArgument",
-        "InvalidBucketName",
-        "MalformedXML",
-        "NotImplemented",
-        "MethodNotAllowed",
-        "AccessDenied",
-        "SignatureDoesNotMatch",
-        "RequestTimeTooSkewed",
-    ] {
-        if text.contains(code) {
-            return code.to_string();
-        }
-    }
-    "InternalError".to_string()
+    S3_ERRORS
+        .iter()
+        .find(|(code, _)| text.contains(code))
+        .map(|(code, _)| (*code).to_string())
+        .unwrap_or_else(|| "InternalError".to_string())
 }
 
 fn public_error_message(code: &str, error: &anyhow::Error) -> String {
@@ -912,6 +921,12 @@ fn error_response(
     uri: &Uri,
     request_id: &str,
 ) -> Response {
+    if status == StatusCode::NOT_MODIFIED {
+        // 304 responses must not carry a body.
+        let mut response = empty_response(status);
+        insert_header(response.headers_mut(), "x-amz-request-id", request_id);
+        return response;
+    }
     let retryable = code == "SlowDown";
     let response = ErrorXml {
         code,
@@ -935,6 +950,21 @@ fn error_response(
         insert_header(response.headers_mut(), "retry-after", "5");
     }
     response
+}
+
+fn is_streaming_payload(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-amz-content-sha256")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("STREAMING-"))
+        || headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("aws-chunked"))
+            })
 }
 
 fn request_content_length(headers: &HeaderMap) -> Result<Option<i64>> {

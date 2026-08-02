@@ -48,7 +48,7 @@ pub(super) async fn upload_known_length(
         }
         if next_total > expected_length {
             failure = Some(anyhow!(
-                "request Content-Length {expected_length} does not match body length {next_total}"
+                "IncompleteBody: request Content-Length {expected_length} does not match body length {next_total}"
             ));
             break;
         }
@@ -136,7 +136,9 @@ pub(super) async fn upload_known_length(
         return Err(error);
     }
     if total != expected_length {
-        bail!("request Content-Length {expected_length} does not match body length {total}");
+        bail!(
+            "IncompleteBody: request Content-Length {expected_length} does not match body length {total}"
+        );
     }
     Ok((uploaded, total, digest))
 }

@@ -328,6 +328,23 @@ impl BotApiClient {
         Ok(())
     }
 
+    /// Deletes up to 100 messages per Bot API call; messages that no longer
+    /// exist are skipped silently by Telegram.
+    pub async fn delete_messages(&self, message_ids: &[i64]) -> Result<()> {
+        for chunk in message_ids.chunks(100) {
+            let _: bool = self
+                .call_post(
+                    "deleteMessages",
+                    &[
+                        ("chat_id", self.chat_id.to_string()),
+                        ("message_ids", serde_json::to_string(chunk)?),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn call_get<T: DeserializeOwned>(
         &self,
         method: &str,
