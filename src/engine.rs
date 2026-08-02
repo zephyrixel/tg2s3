@@ -1,8 +1,6 @@
 use crate::config::Config;
 use crate::db::Db;
-use crate::limits::{
-    AdmissionPermit, TransferContext, TransferDirection, TransferLimits, check_size,
-};
+use crate::limits::{AdmissionPermit, TransferDirection, TransferLimits, check_size};
 use crate::model::{
     BlockRef, ObjectCondition, ObjectMetadata, ObjectRecord, PartRecord, TelegramBackend,
     UploadRecord, normalize_etag,
@@ -60,7 +58,6 @@ impl Engine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -69,7 +66,6 @@ impl Engine {
         metadata: ObjectMetadata,
         expected_length: Option<i64>,
         condition: ObjectCondition,
-        transfer: Option<TransferContext>,
     ) -> Result<ObjectRecord> {
         self.require_bucket(bucket).await?;
         check_size(expected_length, self.config.max_object_size)?;
@@ -86,7 +82,7 @@ impl Engine {
             .await?;
         let result = async {
             let (part, actual_length) = self
-                .upload_stream(&upload_id, 0, body, expected_length, transfer.as_ref())
+                .upload_stream(&upload_id, 0, body, expected_length)
                 .await?;
             if let Some(expected) = expected_length
                 && expected != actual_length
@@ -140,7 +136,6 @@ impl Engine {
         part_number: i32,
         body: Body,
         expected_length: Option<i64>,
-        transfer: Option<TransferContext>,
     ) -> Result<PartRecord> {
         if !(1..=10_000).contains(&part_number) {
             bail!("part number must be between 1 and 10,000");
@@ -155,13 +150,7 @@ impl Engine {
         }
         check_size(expected_length, self.config.max_object_size)?;
         let (part, size) = self
-            .upload_stream(
-                upload_id,
-                part_number,
-                body,
-                expected_length,
-                transfer.as_ref(),
-            )
+            .upload_stream(upload_id, part_number, body, expected_length)
             .await?;
         self.db
             .replace_part(upload_id, part_number, size, &part.etag, &part.blocks)
@@ -307,7 +296,6 @@ impl Engine {
         start: i64,
         end: i64,
         admission_permit: Option<AdmissionPermit>,
-        transfer: Option<TransferContext>,
     ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
         let telegram = self.telegram.clone();
         let blocks = object.blocks.clone();
@@ -320,7 +308,6 @@ impl Engine {
             end,
             _admission_permit: admission_permit,
             limits: self.limits.clone(),
-            transfer,
             download_permit: None,
         };
         stream::unfold(state, |mut state| async move {
@@ -347,17 +334,11 @@ impl Engine {
                 state.download_permit = Some(permit);
                 match result {
                     Ok(bytes) => {
-                        if let Some(transfer) = &state.transfer
-                            && let Err(error) = state
-                                .limits
-                                .bandwidth
-                                .throttle(
-                                    TransferDirection::Download,
-                                    transfer.client_ip,
-                                    bytes.len(),
-                                    false,
-                                )
-                                .await
+                        if let Err(error) = state
+                            .limits
+                            .bandwidth
+                            .throttle(TransferDirection::Download, bytes.len(), false)
+                            .await
                         {
                             return Some((Err(std::io::Error::other(error)), state));
                         }
@@ -415,7 +396,6 @@ impl Engine {
         part_number: i32,
         body: Body,
         expected_length: Option<i64>,
-        transfer: Option<&TransferContext>,
     ) -> Result<(PartRecord, i64)> {
         let mut stream = body.into_data_stream();
         let mut tasks = futures_util::stream::FuturesUnordered::new();
@@ -430,17 +410,11 @@ impl Engine {
         loop {
             match stream.next().await {
                 Some(Ok(data)) => {
-                    if let Some(transfer) = transfer
-                        && let Err(error) = self
-                            .limits
-                            .bandwidth
-                            .throttle(
-                                TransferDirection::Upload,
-                                transfer.client_ip,
-                                data.len(),
-                                true,
-                            )
-                            .await
+                    if let Err(error) = self
+                        .limits
+                        .bandwidth
+                        .throttle(TransferDirection::Upload, data.len(), true)
+                        .await
                     {
                         read_error = Some(error);
                         break;
@@ -657,7 +631,6 @@ struct RangeState {
     end: i64,
     _admission_permit: Option<AdmissionPermit>,
     limits: Arc<TransferLimits>,
-    transfer: Option<TransferContext>,
     download_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -917,14 +890,9 @@ mod tests {
             gc_limit: 100,
             max_object_size: crate::config::DEFAULT_MAX_OBJECT_SIZE,
             max_active_transfers: 16,
-            max_active_uploads_per_ip: 2,
-            max_active_downloads_per_ip: 4,
             limit_wait_secs: 5,
             upload_rate_bps: 0,
             download_rate_bps: 0,
-            upload_rate_bps_per_ip: 0,
-            download_rate_bps_per_ip: 0,
-            trusted_proxy_cidrs: Vec::new(),
         };
         let db = Db::open(&config.db_path).await?;
         db.create_bucket("bucket").await?;
@@ -939,11 +907,10 @@ mod tests {
                 ObjectMetadata::default(),
                 Some(data.len() as i64),
                 ObjectCondition::default(),
-                None,
             )
             .await?;
         assert_eq!(object.size, data.len() as i64);
-        let mut stream = Box::pin(engine.range_stream(&object, 6, 13, None, None));
+        let mut stream = Box::pin(engine.range_stream(&object, 6, 13, None));
         let mut result = Vec::new();
         while let Some(chunk) = stream.next().await {
             result.extend_from_slice(&chunk?);

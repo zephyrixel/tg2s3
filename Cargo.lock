@@ -2590,7 +2590,6 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "httpdate",
- "ipnet",
  "md-5",
  "percent-encoding",
  "quick-xml",

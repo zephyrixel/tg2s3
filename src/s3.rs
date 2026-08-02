@@ -1,12 +1,12 @@
 use crate::auth::SigV4;
 use crate::engine::Engine;
-use crate::limits::{TransferContext, TransferDirection, check_size};
+use crate::limits::check_size;
 use crate::model::{
     CorsConfiguration, ObjectCondition, ObjectMetadata, ObjectRecord, normalize_etag,
 };
 use anyhow::{Result, anyhow, bail};
 use axum::body::{Body, to_bytes};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::get;
@@ -15,7 +15,6 @@ use quick_xml::{de::from_str, se::to_string};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::form_urlencoded;
@@ -62,13 +61,6 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
     let request_id = Uuid::new_v4().simple().to_string();
     let request_uri = parts.uri.clone();
     let request_headers = parts.headers.clone();
-    let client_ip = state.engine.limits.client_ip(
-        parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|info| info.0),
-        &parts.headers,
-    );
     let query_keys = query_keys(&parts.uri);
     let is_cors_put = parts.method == Method::PUT
         && form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
@@ -140,23 +132,12 @@ async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> R
         request_id = %request_id,
         method = %parts.method,
         path = %request_uri.path(),
-        client_ip = %client_ip,
         query_keys = ?query_keys,
         host = ?request_headers.get(header::HOST).and_then(|value| value.to_str().ok()),
         "S3 request received"
     );
     let request_method = parts.method.clone();
-    let response = match dispatch(
-        &state,
-        parts.method,
-        parts.uri,
-        parts.headers,
-        body,
-        &request_id,
-        client_ip,
-    )
-    .await
-    {
+    let response = match dispatch(&state, parts.method, parts.uri, parts.headers, body).await {
         Ok(response) => response,
         Err(error) => {
             let status = status_for(&error);
@@ -187,8 +168,6 @@ async fn dispatch(
     uri: Uri,
     headers: HeaderMap,
     body: Body,
-    request_id: &str,
-    client_ip: IpAddr,
 ) -> Result<Response> {
     let target = Target::parse(&uri, &headers, state.public_host.as_deref())?;
     let query: Vec<(String, String)> =
@@ -206,13 +185,10 @@ async fn dispatch(
     }
     let bucket = target.bucket.as_ref().unwrap();
     if target.key.is_none() {
-        return dispatch_bucket(state, method, bucket, &query, body, request_id).await;
+        return dispatch_bucket(state, method, bucket, &query, body).await;
     }
     let key = target.key.as_ref().unwrap();
-    dispatch_object(
-        state, method, bucket, key, &query, &headers, body, request_id, client_ip,
-    )
-    .await
+    dispatch_object(state, method, bucket, key, &query, &headers, body).await
 }
 
 async fn dispatch_bucket(
@@ -221,7 +197,6 @@ async fn dispatch_bucket(
     bucket: &str,
     query: &[(String, String)],
     body: Body,
-    _request_id: &str,
 ) -> Result<Response> {
     if query_has(query, "cors") {
         return match method {
@@ -305,8 +280,6 @@ async fn dispatch_object(
     query: &[(String, String)],
     headers: &HeaderMap,
     body: Body,
-    request_id: &str,
-    client_ip: IpAddr,
 ) -> Result<Response> {
     if !state.engine.db.bucket_exists(bucket).await? {
         bail!("NoSuchBucket");
@@ -330,20 +303,10 @@ async fn dispatch_object(
                     .map_err(|_| anyhow!("InvalidArgument"))?;
                 let length = request_content_length(headers)?;
                 check_size(length, state.engine.limits.max_object_size)?;
-                let context = TransferContext {
-                    request_id: request_id.to_string(),
-                    client_ip,
-                    direction: TransferDirection::Upload,
-                };
-                let _permit = state
-                    .engine
-                    .limits
-                    .admission
-                    .acquire(TransferDirection::Upload, client_ip)
-                    .await?;
+                let _permit = state.engine.limits.admission.acquire().await?;
                 let part = state
                     .engine
-                    .upload_part(&upload_id, part_number, body, length, Some(context))
+                    .upload_part(&upload_id, part_number, body, length)
                     .await?;
                 let mut response = empty_response(StatusCode::OK);
                 response
@@ -375,28 +338,10 @@ async fn dispatch_object(
         let metadata = metadata_from_headers(headers);
         let length = request_content_length(headers)?;
         check_size(length, state.engine.limits.max_object_size)?;
-        let context = TransferContext {
-            request_id: request_id.to_string(),
-            client_ip,
-            direction: TransferDirection::Upload,
-        };
-        let _permit = state
-            .engine
-            .limits
-            .admission
-            .acquire(TransferDirection::Upload, client_ip)
-            .await?;
+        let _permit = state.engine.limits.admission.acquire().await?;
         let object = state
             .engine
-            .put_object(
-                bucket,
-                key,
-                body,
-                metadata,
-                length,
-                condition,
-                Some(context),
-            )
+            .put_object(bucket, key, body, metadata, length, condition)
             .await?;
         let mut response = empty_response(StatusCode::OK);
         response
@@ -418,16 +363,7 @@ async fn dispatch_object(
     } else if method == Method::POST {
         Err(anyhow!("NotImplemented"))
     } else if method == Method::GET || method == Method::HEAD {
-        get_object(
-            &state.engine,
-            bucket,
-            key,
-            headers,
-            method == Method::HEAD,
-            request_id,
-            client_ip,
-        )
-        .await
+        get_object(&state.engine, bucket, key, headers, method == Method::HEAD).await
     } else if method == Method::DELETE {
         let condition = object_condition(headers);
         check_write_conditions(state.engine.db.get_object(bucket, key).await?, &condition)?;
@@ -731,8 +667,6 @@ async fn get_object(
     key: &str,
     headers: &HeaderMap,
     head_only: bool,
-    request_id: &str,
-    client_ip: IpAddr,
 ) -> Result<Response> {
     let object = engine.get_object(bucket, key).await?;
     check_conditions(&object, headers)?;
@@ -753,25 +687,14 @@ async fn get_object(
         response_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     }
     let admission_permit = if !head_only && object.size > 0 {
-        Some(
-            engine
-                .limits
-                .admission
-                .acquire(TransferDirection::Download, client_ip)
-                .await?,
-        )
+        Some(engine.limits.admission.acquire().await?)
     } else {
         None
     };
-    let transfer = admission_permit.as_ref().map(|_| TransferContext {
-        request_id: request_id.to_string(),
-        client_ip,
-        direction: TransferDirection::Download,
-    });
     let body = if head_only || object.size == 0 {
         Body::empty()
     } else {
-        Body::from_stream(engine.range_stream(&object, start, end, admission_permit, transfer))
+        Body::from_stream(engine.range_stream(&object, start, end, admission_permit))
     };
     Ok((
         if partial {

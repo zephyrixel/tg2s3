@@ -174,32 +174,19 @@ diagnostics without logging credentials or presigned query strings. If a
 reverse proxy is used, it must preserve the original `Host` header used by
 Cloudreve for SigV4 signing; do not mount tg2s3 under a URL path prefix.
 
-### Transfer limits and proxy client IPs
+### Transfer limits
 
 `TG2S3_MAX_OBJECT_SIZE` rejects oversized single-part requests and multipart
 objects with `413 EntityTooLarge`. `TG2S3_MAX_ACTIVE_TRANSFERS` is the global
-in-flight transfer limit; upload and download limits can also be set per
-client IP. `TG2S3_LIMIT_WAIT_SECS` bounds admission waiting. When a limit is
-reached, the service returns `503 SlowDown` with `Retry-After: 5`.
+in-flight transfer limit, shared by all clients. `TG2S3_LIMIT_WAIT_SECS`
+bounds admission waiting. When the global limit is reached, the service
+returns `503 SlowDown` with `Retry-After: 5`.
 
-The four `*_RATE_BPS` variables apply byte-per-second backpressure. A value of
-`0` disables that rate. Upload throttling can return `SlowDown` if the next
-bounded wait exceeds `TG2S3_LIMIT_WAIT_SECS`; download throttling applies
-backpressure while the response stream is being produced.
-
-For deployments behind nginx, Caddy, or another reverse proxy, configure the
-proxy's directly connected address or network in
-`TG2S3_TRUSTED_PROXY_CIDRS`. Only then will `Forwarded`, `X-Forwarded-For`, or
-`X-Real-IP` select the client address; otherwise the immediate TCP peer is
-used, preventing clients from spoofing per-IP limits. For a host-local proxy,
-for example:
-
-```dotenv
-TG2S3_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
-```
-
-For Docker, use the actual proxy container network CIDR rather than copying
-the host-local example. Do not trust arbitrary public networks.
+`TG2S3_UPLOAD_RATE_BPS` and `TG2S3_DOWNLOAD_RATE_BPS` apply global
+byte-per-second backpressure. A value of `0` disables that rate. Upload
+throttling can return `SlowDown` if the next bounded wait exceeds
+`TG2S3_LIMIT_WAIT_SECS`; download throttling applies backpressure while the
+response stream is being produced.
 
 ## Compatibility
 

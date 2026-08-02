@@ -17,7 +17,6 @@ hex = "0.4"
 hmac = "0.12"
 http = "1"
 httpdate = "1"
-ipnet = "2"
 md-5 = "0.10"
 percent-encoding = "2"
 quick-xml = { version = "0.37", features = ["serialize"] }

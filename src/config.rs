@@ -1,8 +1,7 @@
 use crate::model::{CorsConfiguration, TelegramBackend};
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use ipnet::IpNet;
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf};
 use url::Url;
 
 const MAX_TELEGRAM_CONCURRENCY: usize = 1024;
@@ -130,12 +129,6 @@ pub struct ConfigArgs {
     #[arg(long, env = "TG2S3_MAX_ACTIVE_TRANSFERS", default_value_t = 16)]
     pub max_active_transfers: usize,
 
-    #[arg(long, env = "TG2S3_MAX_ACTIVE_UPLOADS_PER_IP", default_value_t = 2)]
-    pub max_active_uploads_per_ip: usize,
-
-    #[arg(long, env = "TG2S3_MAX_ACTIVE_DOWNLOADS_PER_IP", default_value_t = 4)]
-    pub max_active_downloads_per_ip: usize,
-
     #[arg(long, env = "TG2S3_LIMIT_WAIT_SECS", default_value_t = 5)]
     pub limit_wait_secs: u64,
 
@@ -144,15 +137,6 @@ pub struct ConfigArgs {
 
     #[arg(long, env = "TG2S3_DOWNLOAD_RATE_BPS", default_value_t = 0)]
     pub download_rate_bps: u64,
-
-    #[arg(long, env = "TG2S3_UPLOAD_RATE_BPS_PER_IP", default_value_t = 0)]
-    pub upload_rate_bps_per_ip: u64,
-
-    #[arg(long, env = "TG2S3_DOWNLOAD_RATE_BPS_PER_IP", default_value_t = 0)]
-    pub download_rate_bps_per_ip: u64,
-
-    #[arg(long, env = "TG2S3_TRUSTED_PROXY_CIDRS", default_value = "")]
-    pub trusted_proxy_cidrs: String,
 }
 
 #[derive(Clone)]
@@ -186,14 +170,9 @@ pub struct Config {
     pub gc_limit: usize,
     pub max_object_size: i64,
     pub max_active_transfers: usize,
-    pub max_active_uploads_per_ip: usize,
-    pub max_active_downloads_per_ip: usize,
     pub limit_wait_secs: u64,
     pub upload_rate_bps: u64,
     pub download_rate_bps: u64,
-    pub upload_rate_bps_per_ip: u64,
-    pub download_rate_bps_per_ip: u64,
-    pub trusted_proxy_cidrs: Vec<IpNet>,
 }
 
 impl ConfigArgs {
@@ -288,39 +267,17 @@ impl ConfigArgs {
         if self.max_active_transfers == 0 || self.max_active_transfers > MAX_ACTIVE_TRANSFERS {
             bail!("TG2S3_MAX_ACTIVE_TRANSFERS must be between 1 and {MAX_ACTIVE_TRANSFERS}");
         }
-        if self.max_active_uploads_per_ip == 0
-            || self.max_active_uploads_per_ip > MAX_ACTIVE_TRANSFERS
-            || self.max_active_downloads_per_ip == 0
-            || self.max_active_downloads_per_ip > MAX_ACTIVE_TRANSFERS
-        {
-            bail!("per-IP active transfer limits must be between 1 and {MAX_ACTIVE_TRANSFERS}");
-        }
         if self.limit_wait_secs > MAX_LIMIT_WAIT_SECS {
             bail!("TG2S3_LIMIT_WAIT_SECS must be at most {MAX_LIMIT_WAIT_SECS}");
         }
         for (name, value) in [
             ("TG2S3_UPLOAD_RATE_BPS", self.upload_rate_bps),
             ("TG2S3_DOWNLOAD_RATE_BPS", self.download_rate_bps),
-            ("TG2S3_UPLOAD_RATE_BPS_PER_IP", self.upload_rate_bps_per_ip),
-            (
-                "TG2S3_DOWNLOAD_RATE_BPS_PER_IP",
-                self.download_rate_bps_per_ip,
-            ),
         ] {
             if value > MAX_RATE_BPS {
                 bail!("{name} must be at most {MAX_RATE_BPS} bytes per second");
             }
         }
-        let trusted_proxy_cidrs = self
-            .trusted_proxy_cidrs
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                IpNet::from_str(value)
-                    .with_context(|| format!("parse TG2S3_TRUSTED_PROXY_CIDRS entry {value}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
         match (&self.access_key, &self.secret_key) {
             (Some(access_key), Some(secret_key))
                 if !access_key.is_empty() && !secret_key.is_empty() => {}
@@ -395,14 +352,9 @@ impl ConfigArgs {
             max_object_size: i64::try_from(self.max_object_size)
                 .context("TG2S3_MAX_OBJECT_SIZE does not fit SQLite integer range")?,
             max_active_transfers: self.max_active_transfers,
-            max_active_uploads_per_ip: self.max_active_uploads_per_ip,
-            max_active_downloads_per_ip: self.max_active_downloads_per_ip,
             limit_wait_secs: self.limit_wait_secs,
             upload_rate_bps: self.upload_rate_bps,
             download_rate_bps: self.download_rate_bps,
-            upload_rate_bps_per_ip: self.upload_rate_bps_per_ip,
-            download_rate_bps_per_ip: self.download_rate_bps_per_ip,
-            trusted_proxy_cidrs,
         })
     }
 }
@@ -523,14 +475,9 @@ mod tests {
             gc_limit: 100,
             max_object_size: DEFAULT_MAX_OBJECT_SIZE as u64,
             max_active_transfers: 16,
-            max_active_uploads_per_ip: 2,
-            max_active_downloads_per_ip: 4,
             limit_wait_secs: 5,
             upload_rate_bps: 0,
             download_rate_bps: 0,
-            upload_rate_bps_per_ip: 0,
-            download_rate_bps_per_ip: 0,
-            trusted_proxy_cidrs: String::new(),
         };
         let config = args.clone().into_config(false, false)?;
         assert_eq!(config.init_buckets, ["A", "cloudreve"]);
