@@ -1,4 +1,5 @@
 mod bot_api;
+mod download;
 mod grammers;
 mod session;
 
@@ -6,9 +7,15 @@ use crate::config::Config;
 use crate::model::{BlockRef, TelegramBackend};
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
+use futures_util::Stream;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::io::AsyncRead;
 
 pub use bot_api::{BotApiClient, ChatCheck};
+
+pub type UploadReader = Pin<Box<dyn AsyncRead + Send + Unpin + 'static>>;
+pub type DownloadStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + 'static>>;
 
 #[derive(Clone, Debug)]
 pub struct StoredDocument {
@@ -70,31 +77,45 @@ impl TelegramClient {
         }
     }
 
-    pub async fn upload_chunk(&self, data: Bytes, filename: &str) -> Result<StoredDocument> {
+    pub async fn upload_stream(
+        &self,
+        reader: UploadReader,
+        size: u64,
+        filename: &str,
+    ) -> Result<StoredDocument> {
         match self.active_backend {
-            TelegramBackend::BotApi => Ok(self.bot_api.upload_chunk(data, filename).await?.into()),
+            TelegramBackend::BotApi => Ok(self
+                .bot_api
+                .upload_stream(reader, size, filename)
+                .await?
+                .into()),
             TelegramBackend::Grammers => {
                 self.grammers
                     .as_ref()
                     .ok_or_else(|| anyhow!("grammers backend is not initialized"))?
-                    .upload_chunk(data, filename)
+                    .upload_stream(reader, size, filename)
                     .await
             }
         }
     }
 
-    pub async fn download_chunk(&self, block: &BlockRef, start: i64, end: i64) -> Result<Bytes> {
+    pub async fn download_stream(
+        &self,
+        block: &BlockRef,
+        start: i64,
+        end: i64,
+    ) -> Result<DownloadStream> {
         match block.backend {
             TelegramBackend::BotApi => {
                 self.bot_api
-                    .download_chunk(&block.file_id, start, end)
+                    .download_stream(&block.file_id, start, end)
                     .await
             }
             TelegramBackend::Grammers => {
                 self.grammers
                     .as_ref()
                     .ok_or_else(|| anyhow!("grammers backend is not initialized"))?
-                    .download_chunk(block.message_id, start, end)
+                    .download_stream(block.message_id, start, end)
                     .await
             }
         }

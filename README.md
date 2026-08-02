@@ -10,6 +10,15 @@ can be selected for streaming Telegram downloads and larger document chunks.
 The transport is recorded for every stored block, so existing Bot API objects
 remain readable when new objects use grammers.
 
+Uploads with a known `Content-Length` now stream directly from the S3 request
+into Telegram through a fixed 1 MiB bounded pipe. Downloads stream Telegram
+response chunks directly into the S3 response, including Range requests; the
+service does not assemble a complete logical block or Range in memory. A
+request without `Content-Length` is written to
+`TG2S3_DATA_DIR/upload-spool` first because the Telegram upload APIs require an
+exact block size, then read back in bounded streams. `TG2S3_CHUNK_SIZE` is the
+logical Telegram document size, not a memory allocation.
+
 This is a single-process local service. Telegram is not a replicated object
 store: back up `./data` and preserve the same Bot identity. Objects are stored
 in plaintext in the configured Telegram chat.
@@ -66,19 +75,20 @@ the requested range from that path. A Cloudreve range request can therefore
 consume one complete tg2s3 block on the Bot API volume even when the client
 requested only a few bytes.
 
-Let `C` be `TG2S3_CHUNK_SIZE`, `D` be
-`TG2S3_DOWNLOAD_CONCURRENCY`, and `U` be `TG2S3_UPLOAD_CONCURRENCY`:
+Let `D` be `TG2S3_DOWNLOAD_CONCURRENCY` and `U` be
+`TG2S3_UPLOAD_CONCURRENCY`:
 
 ```text
-transient working set ~= C * (D + U)
+tg2s3 process working set ~= 1 MiB * (D + U) + Telegram SDK overhead
 recommended volume ~= (unique block bytes likely retained locally
-                       + transient working set) * 1.25
+                       + local Bot API working set) * 1.25
 ```
 
-The first term is the important one. It is not bounded by `C` or by the
-concurrency settings, because tg2s3 does not control Bot API/TDLib file
-eviction. For the default `16 MiB`, `D=4`, and `U=4`, reserve about `128 MiB`
-for transient transfers, then add the unique data expected to be read through
+The local Bot API working set is the important term. It is not bounded by
+tg2s3's transfer buffer or by the concurrency settings, because tg2s3 does
+not control Bot API/TDLib file eviction. For `D=4` and `U=4`, reserve about
+`8 MiB` plus SDK and filesystem overhead for tg2s3 transfer buffers, then add
+the unique data expected to be read through
 the local Bot API. For example, fully reading a 4 GiB object normally makes
 roughly 4 GiB of its blocks eligible for the local working directory, so a
 5-6 GiB volume is a practical minimum for that workload. If 100 GiB of unique
@@ -187,6 +197,13 @@ byte-per-second backpressure. A value of `0` disables that rate. Upload
 throttling can return `SlowDown` if the next bounded wait exceeds
 `TG2S3_LIMIT_WAIT_SECS`; download throttling applies backpressure while the
 response stream is being produced.
+
+The fixed tg2s3 transfer pipe is 1 MiB per active upload. It is independent of
+`C`; increasing `C` changes the number and size of Telegram documents but does
+not create a matching in-memory buffer. When the public endpoint is behind
+Cloudflare, its request-body limit still applies before tg2s3 receives the
+request, so Cloudreve multipart parts must remain below that limit or use a
+direct/DNS-only S3 endpoint.
 
 ## Compatibility
 

@@ -1,15 +1,14 @@
 use crate::config::Config;
 use crate::db::Db;
-use crate::limits::{AdmissionPermit, TransferDirection, TransferLimits, check_size};
+use crate::limits::{AdmissionPermit, TransferLimits, check_size};
 use crate::model::{
-    BlockRef, ObjectCondition, ObjectMetadata, ObjectRecord, PartRecord, TelegramBackend,
-    UploadRecord, normalize_etag,
+    ObjectCondition, ObjectMetadata, ObjectRecord, PartRecord, UploadRecord, normalize_etag,
 };
 use crate::telegram::{TelegramClient, is_missing_message};
 use anyhow::{Result, anyhow, bail};
 use axum::body::Body;
-use bytes::{Bytes, BytesMut};
-use futures_util::{Stream, StreamExt, stream};
+use bytes::Bytes;
+use futures_util::Stream;
 use md5::{Digest, Md5};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -28,19 +27,6 @@ pub struct Engine {
     pub limits: Arc<TransferLimits>,
     upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
-}
-
-#[derive(Clone, Debug)]
-struct UploadedBlock {
-    ordinal: i64,
-    offset: i64,
-    data_size: i64,
-    message_id: i64,
-    backend: TelegramBackend,
-    document_id: Option<i64>,
-    file_id: String,
-    file_unique_id: String,
-    message_date: i64,
 }
 
 impl Engine {
@@ -297,58 +283,15 @@ impl Engine {
         end: i64,
         admission_permit: Option<AdmissionPermit>,
     ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-        let telegram = self.telegram.clone();
-        let blocks = object.blocks.clone();
-        let state = RangeState {
-            telegram,
-            download_slots: self.download_slots.clone(),
-            blocks,
-            index: 0,
+        crate::transfer::range_stream(
+            self.telegram.clone(),
+            self.download_slots.clone(),
+            object.blocks.clone(),
             start,
             end,
-            _admission_permit: admission_permit,
-            limits: self.limits.clone(),
-            download_permit: None,
-        };
-        stream::unfold(state, |mut state| async move {
-            state.download_permit.take();
-            while state.index < state.blocks.len() {
-                let block = state.blocks[state.index].clone();
-                state.index += 1;
-                let block_end = block.offset + block.size - 1;
-                if block_end < state.start || block.offset > state.end {
-                    continue;
-                }
-                let read_start = state.start.max(block.offset) - block.offset;
-                let read_end = state.end.min(block_end) - block.offset;
-                let permit = match state.download_slots.clone().acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        return Some((Err(std::io::Error::other(error)), state));
-                    }
-                };
-                let result = state
-                    .telegram
-                    .download_chunk(&block, read_start, read_end)
-                    .await;
-                state.download_permit = Some(permit);
-                match result {
-                    Ok(bytes) => {
-                        if let Err(error) = state
-                            .limits
-                            .bandwidth
-                            .throttle(TransferDirection::Download, bytes.len(), false)
-                            .await
-                        {
-                            return Some((Err(std::io::Error::other(error)), state));
-                        }
-                        return Some((Ok(bytes), state));
-                    }
-                    Err(error) => return Some((Err(std::io::Error::other(error)), state)),
-                }
-            }
-            None
-        })
+            admission_permit,
+            self.limits.clone(),
+        )
     }
 
     pub async fn run_gc(&self, limit: usize) -> Result<usize> {
@@ -397,221 +340,14 @@ impl Engine {
         body: Body,
         expected_length: Option<i64>,
     ) -> Result<(PartRecord, i64)> {
-        let mut stream = body.into_data_stream();
-        let mut tasks = futures_util::stream::FuturesUnordered::new();
-        let mut buffer = BytesMut::with_capacity(self.config.chunk_size.min(16 * 1024 * 1024));
-        let mut ordinal = 0_i64;
-        let mut offset = 0_i64;
-        let mut digest = Md5::new();
-        let mut total = 0_i64;
-        let mut read_error = None;
-        let mut uploaded = Vec::new();
-
-        loop {
-            match stream.next().await {
-                Some(Ok(data)) => {
-                    if let Err(error) = self
-                        .limits
-                        .bandwidth
-                        .throttle(TransferDirection::Upload, data.len(), true)
-                        .await
-                    {
-                        read_error = Some(error);
-                        break;
-                    }
-                    digest.update(&data);
-                    total = total
-                        .checked_add(data.len() as i64)
-                        .ok_or_else(|| anyhow!("object is too large"))?;
-                    if total > self.config.max_object_size {
-                        read_error = Some(anyhow!("EntityTooLarge"));
-                        break;
-                    }
-                    buffer.extend_from_slice(&data);
-                    while buffer.len() >= self.config.chunk_size {
-                        let chunk = buffer.split_to(self.config.chunk_size).freeze();
-                        let permit = self
-                            .upload_slots
-                            .clone()
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| anyhow!("upload semaphore closed"))?;
-                        let task = self.spawn_chunk(
-                            upload_id.to_string(),
-                            part_number,
-                            ordinal,
-                            offset,
-                            chunk,
-                            permit,
-                        );
-                        tasks.push(task);
-                        ordinal += 1;
-                        offset = offset
-                            .checked_add(self.config.chunk_size as i64)
-                            .ok_or_else(|| anyhow!("object is too large"))?;
-                        if tasks.len() >= self.config.upload_concurrency
-                            && let Some(result) = tasks.next().await
-                        {
-                            match result {
-                                Ok(Ok(block)) => uploaded.push(block),
-                                Ok(Err(error)) => {
-                                    if read_error.is_none() {
-                                        read_error = Some(error)
-                                    }
-                                }
-                                Err(error) => {
-                                    if read_error.is_none() {
-                                        read_error = Some(anyhow!(error))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(Err(error)) => {
-                    read_error = Some(anyhow!(error));
-                    break;
-                }
-                None => break,
-            }
-        }
-        if !buffer.is_empty() {
-            let size = buffer.len() as i64;
-            let chunk = buffer.freeze();
-            let permit = self
-                .upload_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("upload semaphore closed"))?;
-            tasks.push(self.spawn_chunk(
-                upload_id.to_string(),
-                part_number,
-                ordinal,
-                offset,
-                chunk,
-                permit,
-            ));
-            offset = offset
-                .checked_add(size)
-                .ok_or_else(|| anyhow!("object is too large"))?;
-        }
-        let mut task_error = read_error;
-        while let Some(result) = tasks.next().await {
-            match result {
-                Ok(Ok(block)) => uploaded.push(block),
-                Ok(Err(error)) => {
-                    if task_error.is_none() {
-                        task_error = Some(error)
-                    }
-                }
-                Err(error) => {
-                    if task_error.is_none() {
-                        task_error = Some(anyhow!(error))
-                    }
-                }
-            }
-        }
-        let refs = self.stage_uploaded_blocks(uploaded).await?;
-        if let Some(error) = task_error {
-            return Err(error);
-        }
-        if let Some(expected_length) = expected_length
-            && expected_length != total
-        {
-            bail!("request Content-Length {expected_length} does not match body length {total}");
-        }
-        let etag = format!("{:x}", digest.finalize());
-        Ok((
-            PartRecord {
-                upload_id: upload_id.to_string(),
-                part_number,
-                size: offset,
-                etag,
-                blocks: refs,
-            },
-            total,
-        ))
-    }
-
-    async fn stage_uploaded_blocks(
-        &self,
-        mut uploaded: Vec<UploadedBlock>,
-    ) -> Result<Vec<BlockRef>> {
-        uploaded.sort_by_key(|block| block.ordinal);
-        let mut refs = Vec::with_capacity(uploaded.len());
-        for (index, block) in uploaded.iter().enumerate() {
-            let reference = BlockRef {
-                id: 0,
-                ordinal: block.ordinal,
-                offset: block.offset,
-                size: block.data_size,
-                chat_id: self.config.chat_id,
-                message_id: block.message_id,
-                backend: block.backend,
-                document_id: block.document_id,
-                file_id: block.file_id.clone(),
-                file_unique_id: block.file_unique_id.clone(),
-                message_date: block.message_date,
-            };
-            let id = match self.db.add_staged_block(&reference).await {
-                Ok(id) => id,
-                Err(error) => {
-                    for orphan in uploaded.iter().skip(index) {
-                        if let Err(cleanup_error) = self
-                            .telegram
-                            .delete_message_by_id(orphan.backend, orphan.message_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                message_id = orphan.message_id,
-                                error = %cleanup_error,
-                                "failed to clean up an untracked Telegram upload"
-                            );
-                        }
-                    }
-                    return Err(error);
-                }
-            };
-            refs.push(BlockRef { id, ..reference });
-        }
-        Ok(refs)
-    }
-
-    fn spawn_chunk(
-        &self,
-        upload_id: String,
-        part_number: i32,
-        ordinal: i64,
-        offset: i64,
-        data: Bytes,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> tokio::task::JoinHandle<Result<UploadedBlock>> {
-        let telegram = self.telegram.clone();
-        let filename = format!("tg2s3-{}-{}-{}.part", upload_id, part_number, ordinal);
-        tokio::spawn(async move {
-            let _permit = permit;
-            let size = data.len() as i64;
-            let document = telegram.upload_chunk(data, &filename).await?;
-            if document.file_size != 0 && document.file_size != size {
-                bail!(
-                    "Telegram stored chunk with size {}, expected {}",
-                    document.file_size,
-                    size
-                );
-            }
-            Ok(UploadedBlock {
-                ordinal,
-                offset,
-                data_size: size,
-                message_id: document.message_id,
-                backend: document.backend,
-                document_id: document.document_id,
-                file_id: document.file_id,
-                file_unique_id: document.file_unique_id,
-                message_date: document.message_date,
-            })
-        })
+        let context = crate::transfer::UploadContext::new(
+            &self.db,
+            &self.telegram,
+            self.config.clone(),
+            self.limits.clone(),
+            self.upload_slots.clone(),
+        );
+        crate::transfer::upload(context, upload_id, part_number, body, expected_length).await
     }
 
     async fn require_bucket(&self, bucket: &str) -> Result<()> {
@@ -620,18 +356,6 @@ impl Engine {
         }
         Ok(())
     }
-}
-
-struct RangeState {
-    telegram: TelegramClient,
-    download_slots: Arc<Semaphore>,
-    blocks: Vec<BlockRef>,
-    index: usize,
-    start: i64,
-    end: i64,
-    _admission_permit: Option<AdmissionPermit>,
-    limits: Arc<TransferLimits>,
-    download_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 fn validate_object_layout(object: &ObjectRecord) -> Result<()> {
@@ -666,20 +390,24 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::db::Db;
+    use crate::model::{BlockRef, TelegramBackend};
     use anyhow::Context;
     use axum::extract::State;
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use futures_util::StreamExt;
+    use futures_util::stream;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     #[derive(Clone)]
     struct MockState {
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         next_id: Arc<std::sync::atomic::AtomicI64>,
+        upload_started: Arc<Notify>,
     }
 
     async fn mock_telegram(State(state): State<MockState>, request: Request<Body>) -> Response {
@@ -698,6 +426,7 @@ mod tests {
             );
         }
         if path.ends_with("/sendDocument") {
+            state.upload_started.notify_one();
             let content_type = request
                 .headers()
                 .get("content-type")
@@ -846,7 +575,9 @@ mod tests {
         let state = MockState {
             files: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            upload_started: Arc::new(Notify::new()),
         };
+        let upload_started = state.upload_started.clone();
         let app = axum::Router::new()
             .fallback(mock_telegram)
             .with_state(state);
@@ -869,7 +600,7 @@ mod tests {
             telegram_backend: TelegramBackend::BotApi,
             telegram_api_url: format!("http://{address}"),
             local_bot_api: false,
-            chunk_size: 4,
+            chunk_size: 8,
             upload_concurrency: 2,
             download_concurrency: 2,
             telegram_timeout_secs: 300,
@@ -898,6 +629,67 @@ mod tests {
         db.create_bucket("bucket").await?;
         let telegram = TelegramClient::new(&config)?;
         let engine = Engine::new(config, db, telegram);
+
+        let source_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_source = Arc::new(Notify::new());
+        let source_done_for_stream = source_done.clone();
+        let release_for_stream = release_source.clone();
+        let body_stream = stream::unfold(0_u8, move |state| {
+            let source_done = source_done_for_stream.clone();
+            let release_source = release_for_stream.clone();
+            async move {
+                match state {
+                    0 => Some((
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"0123")),
+                        1,
+                    )),
+                    1 => {
+                        release_source.notified().await;
+                        source_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Some((Ok(Bytes::from_static(b"4567")), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        let streaming_upload = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .put_object(
+                        "bucket",
+                        "streamed",
+                        Body::from_stream(body_stream),
+                        ObjectMetadata::default(),
+                        Some(8),
+                        ObjectCondition::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), upload_started.notified())
+            .await
+            .context("Telegram upload did not start before request EOF")?;
+        assert!(!source_done.load(std::sync::atomic::Ordering::SeqCst));
+        release_source.notify_one();
+        streaming_upload.await??;
+
+        let spooled = engine
+            .put_object(
+                "bucket",
+                "spooled",
+                Body::from_stream(stream::iter(vec![Ok::<_, std::convert::Infallible>(
+                    Bytes::from_static(b"unknown length body"),
+                )])),
+                ObjectMetadata::default(),
+                None,
+                ObjectCondition::default(),
+            )
+            .await?;
+        assert_eq!(spooled.size, 19);
+        let mut spools = tokio::fs::read_dir(engine.config.data_dir.join("upload-spool")).await?;
+        assert!(spools.next_entry().await?.is_none());
+
         let data = b"hello telegram storage";
         let object = engine
             .put_object(

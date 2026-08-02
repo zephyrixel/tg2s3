@@ -1,7 +1,9 @@
+use super::download::exact_range_stream;
+use super::{DownloadStream, UploadReader};
 use crate::config::Config;
 use crate::model::{BlockRef, TelegramBackend};
 use anyhow::{Result, anyhow};
-use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -9,6 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::sleep;
+use tokio_util::io::ReaderStream;
 
 #[derive(Clone)]
 pub struct BotApiClient {
@@ -57,10 +60,10 @@ struct TelegramFailure {
 fn retry_policy(error: &anyhow::Error, idempotent: bool) -> (bool, Option<Duration>) {
     if let Some(failure) = error.downcast_ref::<TelegramFailure>() {
         return (
-            failure.status == StatusCode::TOO_MANY_REQUESTS
-                || (idempotent
-                    && (failure.status == StatusCode::REQUEST_TIMEOUT
-                        || failure.status.is_server_error())),
+            idempotent
+                && (failure.status == StatusCode::TOO_MANY_REQUESTS
+                    || failure.status == StatusCode::REQUEST_TIMEOUT
+                    || failure.status.is_server_error()),
             failure.retry_after,
         );
     }
@@ -199,35 +202,48 @@ impl BotApiClient {
         Ok(self.call_get::<User>("getMe", &[]).await?.id)
     }
 
-    pub async fn upload_chunk(&self, data: Bytes, filename: &str) -> Result<UploadedDocument> {
+    pub async fn upload_stream(
+        &self,
+        reader: UploadReader,
+        size: u64,
+        filename: &str,
+    ) -> Result<UploadedDocument> {
         let api_url = self.method_url("sendDocument");
-        self.retry("sendDocument", false, || async {
-            let document = reqwest::multipart::Part::stream_with_length(
-                reqwest::Body::from(data.clone()),
-                data.len() as u64,
-            )
-            .file_name(filename.to_string());
-            let form = reqwest::multipart::Form::new()
-                .text("chat_id", self.chat_id.to_string())
-                .text("disable_notification", "true")
-                .part("document", document);
-            let response = self.client.post(&api_url).multipart(form).send().await?;
-            let message: Message = self.decode(response, "sendDocument").await?;
-            let document = message
-                .document
-                .ok_or_else(|| anyhow!("Telegram sendDocument returned no document"))?;
-            Ok(UploadedDocument {
-                message_id: message.message_id,
-                file_id: document.file_id,
-                file_unique_id: document.file_unique_id,
-                file_size: document.file_size.unwrap_or(data.len() as i64),
-                message_date: message.date,
-            })
+        let document = reqwest::multipart::Part::stream_with_length(
+            reqwest::Body::wrap_stream(ReaderStream::with_capacity(
+                reader,
+                crate::transfer::STREAM_BUFFER_SIZE,
+            )),
+            size,
+        )
+        .file_name(filename.to_string());
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", self.chat_id.to_string())
+            .text("disable_notification", "true")
+            .part("document", document);
+        let response = self.client.post(&api_url).multipart(form).send().await?;
+        let message: Message = self.decode(response, "sendDocument").await?;
+        let document = message
+            .document
+            .ok_or_else(|| anyhow!("Telegram sendDocument returned no document"))?;
+        let file_size = document
+            .file_size
+            .unwrap_or_else(|| i64::try_from(size).unwrap_or(i64::MAX));
+        Ok(UploadedDocument {
+            message_id: message.message_id,
+            file_id: document.file_id,
+            file_unique_id: document.file_unique_id,
+            file_size,
+            message_date: message.date,
         })
-        .await
     }
 
-    pub async fn download_chunk(&self, file_id: &str, start: i64, end: i64) -> Result<Bytes> {
+    pub async fn download_stream(
+        &self,
+        file_id: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<DownloadStream> {
         if start < 0 || end < start {
             return Err(anyhow!("invalid Telegram range"));
         }
@@ -237,18 +253,21 @@ impl BotApiClient {
         let path = info
             .file_path
             .ok_or_else(|| anyhow!("Telegram getFile returned no file_path"))?;
-        let expected = usize::try_from(
+        let expected = u64::try_from(
             end.checked_sub(start)
                 .and_then(|length| length.checked_add(1))
                 .ok_or_else(|| anyhow!("Telegram range is too large"))?,
         )
-        .map_err(|_| anyhow!("Telegram range does not fit in memory"))?;
+        .map_err(|_| anyhow!("Telegram range is too large"))?;
         if self.local_bot_api && Path::new(&path).is_absolute() {
             let mut file = tokio::fs::File::open(&path).await?;
             file.seek(std::io::SeekFrom::Start(start as u64)).await?;
-            let mut data = vec![0_u8; expected];
-            file.read_exact(&mut data).await?;
-            return Ok(Bytes::from(data));
+            let source = ReaderStream::with_capacity(
+                file.take(expected),
+                crate::transfer::STREAM_BUFFER_SIZE,
+            )
+            .map(|result| result.map_err(anyhow::Error::new));
+            return Ok(exact_range_stream(source, 0, expected));
         }
         let url = format!(
             "{}/file/bot{}/{}",
@@ -256,39 +275,34 @@ impl BotApiClient {
             self.token,
             path.trim_start_matches('/')
         );
-        self.retry("file download", true, || async {
-            let response = self
-                .client
-                .get(&url)
-                .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-                .send()
-                .await?;
-            let status = response.status();
-            if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
-                return Err(anyhow!(TelegramFailure {
-                    status,
-                    description: status.to_string(),
-                    retry_after: None
-                }));
-            }
-            let data = response.bytes().await?;
-            if status == StatusCode::PARTIAL_CONTENT {
-                if data.len() != expected {
-                    return Err(anyhow!(
-                        "Telegram returned {} bytes for {} byte range",
-                        data.len(),
-                        expected
-                    ));
+        let response = self
+            .retry("file download", true, || async {
+                let response = self
+                    .client
+                    .get(&url)
+                    .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+                    .send()
+                    .await?;
+                let status = response.status();
+                if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+                    return Err(anyhow!(TelegramFailure {
+                        status,
+                        description: status.to_string(),
+                        retry_after: None
+                    }));
                 }
-                return Ok(data);
-            }
-            let end_index = start as usize + expected;
-            if data.len() < end_index {
-                return Err(anyhow!("Telegram returned a short file"));
-            }
-            Ok(data.slice(start as usize..end_index))
-        })
-        .await
+                Ok(response)
+            })
+            .await?;
+        let skip = if response.status() == StatusCode::PARTIAL_CONTENT {
+            0
+        } else {
+            start as u64
+        };
+        let source = response
+            .bytes_stream()
+            .map(|result| result.map_err(anyhow::Error::new));
+        Ok(exact_range_stream(source, skip, expected))
     }
 
     pub async fn delete_message(&self, message_id: i64) -> Result<()> {
@@ -457,7 +471,7 @@ mod tests {
         );
         assert_eq!(
             retry_policy(&failure(StatusCode::TOO_MANY_REQUESTS), false),
-            (true, Some(Duration::from_secs(3)))
+            (false, Some(Duration::from_secs(3)))
         );
         assert_eq!(
             retry_policy(&failure(StatusCode::INTERNAL_SERVER_ERROR), true),

@@ -7,3 +7,5 @@ pub mod limits;
 pub mod model;
 pub mod s3;
 pub mod telegram;
+
+pub(crate) mod transfer;

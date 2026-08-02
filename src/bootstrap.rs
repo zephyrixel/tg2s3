@@ -19,6 +19,10 @@ pub async fn prepare(config: Config, verify_telegram: bool) -> Result<Engine> {
         max_active_transfers = config.max_active_transfers,
         "configuration validated"
     );
+    let stale_spools = crate::transfer::cleanup_stale_spools(&config.data_dir).await?;
+    if stale_spools > 0 {
+        tracing::info!(stale_spools, "removed stale upload spools");
+    }
     let db = Db::open(&config.db_path).await?;
     let enable_grammers = verify_telegram
         && (config.telegram_backend == TelegramBackend::Grammers

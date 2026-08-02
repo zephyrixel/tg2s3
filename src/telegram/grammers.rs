@@ -1,8 +1,11 @@
+use super::download::exact_range_stream;
 use super::{ChatCheck, StoredDocument};
+use super::{DownloadStream, UploadReader};
 use crate::config::Config;
 use crate::model::TelegramBackend;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
+use futures_util::stream;
 use grammers_client::client::AutoSleep;
 use grammers_client::client::ClientConfiguration;
 use grammers_client::media::Media;
@@ -10,7 +13,6 @@ use grammers_client::message::InputMessage;
 use grammers_client::peer::Peer;
 use grammers_client::{Client, SenderPool};
 use grammers_session::types::{ChannelKind, PeerId, PeerRef};
-use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,11 +117,16 @@ impl GrammersClient {
         })
     }
 
-    pub async fn upload_chunk(&self, data: Bytes, filename: &str) -> Result<StoredDocument> {
-        let mut stream = Cursor::new(data.clone());
+    pub async fn upload_stream(
+        &self,
+        mut reader: UploadReader,
+        size: u64,
+        filename: &str,
+    ) -> Result<StoredDocument> {
+        let size = usize::try_from(size).context("grammers upload size does not fit usize")?;
         let uploaded = self
             .client
-            .upload_stream(&mut stream, data.len(), filename.to_string())
+            .upload_stream(&mut reader, size, filename.to_string())
             .await
             .map_err(|error| anyhow!("grammers upload failed: {error}"))?;
         let message = self
@@ -136,11 +143,9 @@ impl GrammersClient {
             .size()
             .and_then(|size| i64::try_from(size).ok())
             .ok_or_else(|| anyhow!("grammers document size is unavailable"))?;
-        if file_size != data.len() as i64 {
-            bail!(
-                "grammers stored chunk with size {file_size}, expected {}",
-                data.len()
-            );
+        let expected_size = i64::try_from(size).context("grammers upload size is too large")?;
+        if file_size != expected_size {
+            bail!("grammers stored chunk with size {file_size}, expected {expected_size}");
         }
         Ok(StoredDocument {
             backend: TelegramBackend::Grammers,
@@ -153,7 +158,12 @@ impl GrammersClient {
         })
     }
 
-    pub async fn download_chunk(&self, message_id: i64, start: i64, end: i64) -> Result<Bytes> {
+    pub async fn download_stream(
+        &self,
+        message_id: i64,
+        start: i64,
+        end: i64,
+    ) -> Result<DownloadStream> {
         if start < 0 || end < start {
             bail!("invalid Telegram range");
         }
@@ -178,39 +188,32 @@ impl GrammersClient {
         }
         let chunk_size = i64::from(DOWNLOAD_CHUNK_SIZE);
         let skip = start / chunk_size;
-        let mut offset = skip * chunk_size;
+        let iterator_offset = skip * chunk_size;
         let skip = i32::try_from(skip).context("Telegram download offset is too large")?;
-        let mut iterator = self
+        let iterator = self
             .client
             .iter_download(&document)
             .chunk_size(DOWNLOAD_CHUNK_SIZE)
             .skip_chunks(skip);
-        let expected =
-            usize::try_from(end - start + 1).context("Telegram range does not fit in memory")?;
-        let mut output = Vec::with_capacity(expected);
-        while let Some(chunk) = iterator.next().await.map_err(invocation_error)? {
-            let chunk_start = offset;
-            let chunk_end = offset
-                .checked_add(i64::try_from(chunk.len()).context("Telegram chunk too large")?)
-                .ok_or_else(|| anyhow!("Telegram download offset overflow"))?;
-            let copy_start = start.max(chunk_start) - chunk_start;
-            let copy_end = end.min(chunk_end - 1) - chunk_start + 1;
-            if copy_end > copy_start {
-                output.extend_from_slice(&chunk[copy_start as usize..copy_end as usize]);
+        let source = stream::unfold((iterator, true), |(mut iterator, active)| async move {
+            if !active {
+                return None;
             }
-            offset = chunk_end;
-            if offset > end {
-                break;
+            match iterator.next().await {
+                Ok(Some(chunk)) => Some((Ok(Bytes::from(chunk)), (iterator, true))),
+                Ok(None) => None,
+                Err(error) => Some((Err(invocation_error(error)), (iterator, false))),
             }
-        }
-        if output.len() != expected {
-            bail!(
-                "grammers returned {} bytes for {} byte range",
-                output.len(),
-                expected
-            );
-        }
-        Ok(Bytes::from(output))
+        });
+        let expected = u64::try_from(
+            end.checked_sub(start)
+                .and_then(|length| length.checked_add(1))
+                .ok_or_else(|| anyhow!("Telegram range is too large"))?,
+        )
+        .map_err(|_| anyhow!("Telegram range is too large"))?;
+        let skip_within_chunk = u64::try_from(start - iterator_offset)
+            .context("Telegram download offset is invalid")?;
+        Ok(exact_range_stream(source, skip_within_chunk, expected))
     }
 
     pub async fn delete_message(&self, message_id: i64) -> Result<()> {
