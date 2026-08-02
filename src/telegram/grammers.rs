@@ -134,28 +134,55 @@ impl GrammersClient {
             .send_message(self.peer, InputMessage::new().silent(true).file(uploaded))
             .await
             .map_err(invocation_error)?;
-        let document = match message.media() {
-            Some(Media::Document(document)) => document,
-            Some(_) => bail!("grammers returned a non-document media"),
-            None => bail!("grammers returned a message without media"),
+        let message_id = message.id();
+        let (document_id, file_size) = match message.media() {
+            Some(Media::Document(document)) => {
+                let file_size = document
+                    .size()
+                    .and_then(|size| i64::try_from(size).ok())
+                    .ok_or_else(|| anyhow!("grammers document size is unavailable"));
+                match file_size {
+                    Ok(file_size) => (document.id(), file_size),
+                    Err(error) => {
+                        self.cleanup_sent_message(message_id).await;
+                        return Err(error);
+                    }
+                }
+            }
+            Some(_) => {
+                self.cleanup_sent_message(message_id).await;
+                bail!("grammers returned a non-document media");
+            }
+            None => {
+                self.cleanup_sent_message(message_id).await;
+                bail!("grammers returned a message without media");
+            }
         };
-        let file_size = document
-            .size()
-            .and_then(|size| i64::try_from(size).ok())
-            .ok_or_else(|| anyhow!("grammers document size is unavailable"))?;
         let expected_size = i64::try_from(size).context("grammers upload size is too large")?;
         if file_size != expected_size {
+            self.cleanup_sent_message(message_id).await;
             bail!("grammers stored chunk with size {file_size}, expected {expected_size}");
         }
         Ok(StoredDocument {
             backend: TelegramBackend::Grammers,
-            message_id: i64::from(message.id()),
-            document_id: Some(document.id()),
+            message_id: i64::from(message_id),
+            document_id: Some(document_id),
             file_id: String::new(),
-            file_unique_id: document.id().to_string(),
+            file_unique_id: document_id.to_string(),
             file_size,
             message_date: message.date().timestamp(),
         })
+    }
+
+    async fn cleanup_sent_message(&self, message_id: i32) {
+        match self.client.delete_messages(self.peer, &[message_id]).await {
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                message_id,
+                error = %invocation_error(error),
+                "failed to delete invalid Grammers upload message"
+            ),
+        }
     }
 
     pub async fn download_stream(

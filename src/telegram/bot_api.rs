@@ -223,9 +223,19 @@ impl BotApiClient {
             .part("document", document);
         let response = self.client.post(&api_url).multipart(form).send().await?;
         let message: Message = self.decode(response, "sendDocument").await?;
-        let document = message
-            .document
-            .ok_or_else(|| anyhow!("Telegram sendDocument returned no document"))?;
+        let document = match message.document {
+            Some(document) => document,
+            None => {
+                if let Err(error) = self.delete_message(message.message_id).await {
+                    tracing::warn!(
+                        message_id = message.message_id,
+                        error = %error,
+                        "failed to delete Telegram message without a document"
+                    );
+                }
+                return Err(anyhow!("Telegram sendDocument returned no document"));
+            }
+        };
         let file_size = document
             .file_size
             .unwrap_or_else(|| i64::try_from(size).unwrap_or(i64::MAX));
@@ -454,6 +464,16 @@ impl From<UploadedDocument> for BlockRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::Request;
+    use axum::response::Response;
+    use bytes::Bytes;
+    use futures_util::stream;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn failure(status: StatusCode) -> anyhow::Error {
         anyhow::Error::new(TelegramFailure {
@@ -544,6 +564,58 @@ mod tests {
             .expect_err("gateway error should fail");
         assert!(retry_policy(&error, true).0);
         assert!(!retry_policy(&error, false).0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletes_a_message_when_send_document_has_no_document() -> Result<()> {
+        async fn handler(
+            State(deleted): State<Arc<AtomicUsize>>,
+            request: Request<Body>,
+        ) -> Response {
+            let response = if request.uri().path().ends_with("/sendDocument") {
+                r#"{"ok":true,"result":{"message_id":7,"date":1}}"#
+            } else if request.uri().path().ends_with("/deleteMessage") {
+                deleted.fetch_add(1, Ordering::SeqCst);
+                r#"{"ok":true,"result":true}"#
+            } else {
+                r#"{"ok":false,"description":"unknown method"}"#
+            };
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(response.to_string()))
+                .expect("test response builder")
+        }
+
+        let deleted = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .fallback(handler)
+            .with_state(deleted.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = BotApiClient {
+            token: "token".to_string(),
+            chat_id: -100,
+            api_url: format!("http://{address}"),
+            local_bot_api: false,
+            client: reqwest::Client::new(),
+        };
+        let reader: UploadReader =
+            Box::pin(tokio_util::io::StreamReader::new(stream::iter(vec![Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"abc"),
+            )])));
+        let error = client
+            .upload_stream(reader, 3, "test.bin")
+            .await
+            .expect_err("missing Telegram document should fail");
+        assert!(error.to_string().contains("no document"));
+        assert_eq!(deleted.load(Ordering::SeqCst), 1);
         Ok(())
     }
 }

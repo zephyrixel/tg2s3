@@ -10,11 +10,16 @@ impl Engine {
         }
         let timestamp = now();
         let _ = self.db.expire_uploads(timestamp - 7 * 24 * 3600).await?;
-        for stale in self.db.stale_blocks(timestamp - 3600).await? {
-            self.db.delete_stale_block(stale.block_id).await?;
-        }
-        let candidates = self.db.gc_candidates(timestamp, limit).await?;
         let mut processed = 0;
+        for stale in self.db.stale_blocks(timestamp - 3600, limit).await? {
+            self.db.queue_stale_block(stale.block_id).await?;
+            processed += 1;
+        }
+        let remaining = limit.saturating_sub(processed);
+        if remaining == 0 {
+            return Ok(processed);
+        }
+        let candidates = self.db.gc_candidates(timestamp, remaining).await?;
         for candidate in candidates {
             if candidate.message_date > 0 && candidate.message_date < timestamp - 48 * 3600 {
                 self.db
