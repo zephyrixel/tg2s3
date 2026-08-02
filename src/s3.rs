@@ -1,3 +1,8 @@
+use self::target::{Target, decode_path};
+use self::xml::{
+    BucketLocation, CorsConfigurationXml, ErrorXml, InitiateMultipartUpload, with_namespace,
+    xml_response,
+};
 use crate::auth::SigV4;
 use crate::engine::Engine;
 use crate::limits::check_size;
@@ -10,17 +15,25 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::get;
-use base64::Engine as _;
 use quick_xml::{de::from_str, se::to_string};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::form_urlencoded;
 use uuid::Uuid;
 
-const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+mod list;
+mod multipart;
+mod object;
+mod target;
+#[cfg(test)]
+mod tests;
+mod xml;
+
+use self::list::{list_buckets, list_objects};
+use self::multipart::{complete_multipart, list_multipart_uploads, list_parts, multi_delete};
+use self::object::{copy_object, get_object};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -183,12 +196,32 @@ async fn dispatch(
             _ => Err(anyhow!("MethodNotAllowed")),
         };
     }
-    let bucket = target.bucket.as_ref().unwrap();
-    if target.key.is_none() {
+    let Some(bucket) = target.bucket.as_deref() else {
+        return Err(anyhow!("InvalidRequest"));
+    };
+    let Some(key) = target.key.as_deref() else {
         return dispatch_bucket(state, method, bucket, &query, body).await;
-    }
-    let key = target.key.as_ref().unwrap();
-    dispatch_object(state, method, bucket, key, &query, &headers, body).await
+    };
+    dispatch_object(ObjectRequest {
+        state,
+        method,
+        bucket,
+        key,
+        query: &query,
+        headers: &headers,
+        body,
+    })
+    .await
+}
+
+struct ObjectRequest<'a> {
+    state: &'a AppState,
+    method: Method,
+    bucket: &'a str,
+    key: &'a str,
+    query: &'a [(String, String)],
+    headers: &'a HeaderMap,
+    body: Body,
 }
 
 async fn dispatch_bucket(
@@ -271,16 +304,16 @@ async fn dispatch_bucket(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_object(
-    state: &AppState,
-    method: Method,
-    bucket: &str,
-    key: &str,
-    query: &[(String, String)],
-    headers: &HeaderMap,
-    body: Body,
-) -> Result<Response> {
+async fn dispatch_object(request: ObjectRequest<'_>) -> Result<Response> {
+    let ObjectRequest {
+        state,
+        method,
+        bucket,
+        key,
+        query,
+        headers,
+        body,
+    } = request;
     if !state.engine.db.bucket_exists(bucket).await? {
         bail!("NoSuchBucket");
     }
@@ -500,353 +533,11 @@ async fn effective_bucket_cors(state: &AppState, bucket: &str) -> CorsConfigurat
         .unwrap_or_else(|| state.cors.clone())
 }
 
-async fn list_buckets(engine: &Engine) -> Result<Response> {
-    let buckets = engine.db.list_buckets().await?;
-    let response = ListAllMyBuckets {
-        buckets: Buckets {
-            bucket: buckets
-                .into_iter()
-                .map(|bucket| BucketXml {
-                    name: bucket.name,
-                    creation_date: format_time(bucket.created_at),
-                })
-                .collect(),
-        },
-    };
-    xml_response(response)
-}
-
-async fn list_objects(
-    engine: &Engine,
-    bucket: &str,
-    query: &[(String, String)],
-) -> Result<Response> {
-    if !engine.db.bucket_exists(bucket).await? {
-        bail!("NoSuchBucket");
-    }
-    let prefix = query_value(query, "prefix").unwrap_or_default();
-    let delimiter = query_value(query, "delimiter").unwrap_or_default();
-    let max_keys = match query_value(query, "max-keys") {
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|_| anyhow!("InvalidArgument"))?
-            .min(1000),
-        None => 1000,
-    };
-    let is_v2 = query_value(query, "list-type").as_deref() == Some("2");
-    let start_after = if is_v2 {
-        query_value(query, "start-after")
-    } else {
-        None
-    };
-    let mut after = if is_v2 {
-        start_after.clone().unwrap_or_default()
-    } else {
-        query_value(query, "marker").unwrap_or_default()
-    };
-    if is_v2 && let Some(token) = query_value(query, "continuation-token") {
-        after = String::from_utf8(
-            base64::engine::general_purpose::STANDARD
-                .decode(token)
-                .map_err(|_| anyhow!("InvalidArgument"))?,
-        )
-        .map_err(|_| anyhow!("InvalidArgument"))?;
-    }
-    let mut contents = Vec::new();
-    let mut common_prefixes = Vec::new();
-    let mut seen = HashSet::new();
-    let mut truncated = false;
-    let mut next_cursor = None;
-    let mut limit_prefix: Option<String> = None;
-    const SCAN_BATCH_SIZE: usize = 1000;
-
-    if max_keys > 0 {
-        'scan: loop {
-            let entries = engine
-                .db
-                .list_objects(bucket, &prefix, &after, SCAN_BATCH_SIZE)
-                .await?;
-            let page_len = entries.len();
-            if page_len == 0 {
-                break;
-            }
-            for entry in entries {
-                let entry_prefix = common_prefix(&entry.key, &prefix, &delimiter);
-                if let Some(limit_prefix) = &limit_prefix {
-                    if entry_prefix.as_deref() == Some(limit_prefix.as_str()) {
-                        after = entry.key;
-                        continue;
-                    }
-                    truncated = true;
-                    next_cursor = Some(after.clone());
-                    break 'scan;
-                }
-
-                after = entry.key.clone();
-                if let Some(common) = entry_prefix {
-                    let is_new = seen.insert(common.clone());
-                    if is_new {
-                        common_prefixes.push(CommonPrefix {
-                            prefix: common.clone(),
-                        });
-                    }
-                    if is_new && contents.len() + common_prefixes.len() >= max_keys {
-                        limit_prefix = Some(common);
-                    }
-                } else {
-                    contents.push(ObjectXml {
-                        key: entry.key.clone(),
-                        last_modified: format_time(entry.modified_at),
-                        etag: quoted(&entry.etag),
-                        size: entry.size,
-                        storage_class: "STANDARD".to_string(),
-                    });
-                    if contents.len() + common_prefixes.len() >= max_keys {
-                        let has_more = !engine
-                            .db
-                            .list_objects(bucket, &prefix, &after, 1)
-                            .await?
-                            .is_empty();
-                        truncated = has_more;
-                        if has_more {
-                            next_cursor = Some(after.clone());
-                        }
-                        break 'scan;
-                    }
-                }
-            }
-            if page_len < SCAN_BATCH_SIZE {
-                break;
-            }
-        }
-    }
-    let next = next_cursor
-        .as_deref()
-        .map(|cursor| base64::engine::general_purpose::STANDARD.encode(cursor.as_bytes()));
-    xml_response(ListBucketResult {
-        name: bucket.to_string(),
-        prefix,
-        delimiter: if delimiter.is_empty() {
-            None
-        } else {
-            Some(delimiter)
-        },
-        max_keys: max_keys as i32,
-        key_count: (contents.len() + common_prefixes.len()) as i32,
-        is_truncated: truncated,
-        marker: if is_v2 {
-            None
-        } else {
-            query_value(query, "marker")
-        },
-        start_after,
-        continuation_token: query_value(query, "continuation-token"),
-        next_marker: if truncated && !is_v2 {
-            next_cursor
-        } else {
-            None
-        },
-        next_continuation_token: if is_v2 { next } else { None },
-        contents,
-        common_prefixes,
-    })
-}
-
-fn common_prefix(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
-    if delimiter.is_empty() {
-        return None;
-    }
-    let rest = key.strip_prefix(prefix).unwrap_or(key);
-    rest.find(delimiter)
-        .map(|index| format!("{}{}", prefix, &rest[..index + delimiter.len()]))
-}
-
-async fn get_object(
-    engine: &Engine,
-    bucket: &str,
-    key: &str,
-    headers: &HeaderMap,
-    head_only: bool,
-) -> Result<Response> {
-    let object = engine.get_object(bucket, key).await?;
-    check_conditions(&object, headers)?;
-    let (start, end, partial) = parse_range(
-        headers
-            .get(header::RANGE)
-            .and_then(|value| value.to_str().ok()),
-        object.size,
-    )?;
-    let mut response_headers = object_headers(
-        &object,
-        end.saturating_sub(start).saturating_add(1),
-        start,
-        end,
-        partial,
-    );
-    if object.size == 0 {
-        response_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-    }
-    let admission_permit = if !head_only && object.size > 0 {
-        Some(engine.limits.admission.acquire().await?)
-    } else {
-        None
-    };
-    let body = if head_only || object.size == 0 {
-        Body::empty()
-    } else {
-        Body::from_stream(engine.range_stream(&object, start, end, admission_permit))
-    };
-    Ok((
-        if partial {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        },
-        response_headers,
-        body,
-    )
-        .into_response())
-}
-
-async fn copy_object(
-    state: &AppState,
-    bucket: &str,
-    key: &str,
-    source: &str,
-    headers: &HeaderMap,
-    condition: &ObjectCondition,
-) -> Result<Response> {
-    let (source_bucket, source_key) = parse_copy_source(source)?;
-    let source_object = state.engine.get_object(&source_bucket, &source_key).await?;
-    check_copy_source_conditions(&source_object, headers)?;
-    let metadata = if headers
-        .get("x-amz-metadata-directive")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("REPLACE"))
-        .unwrap_or(false)
-    {
-        metadata_from_headers(headers)
-    } else {
-        source_object.metadata.clone()
-    };
-    let object = state
-        .engine
-        .copy_object(
-            &source_bucket,
-            &source_key,
-            bucket,
-            key,
-            &metadata,
-            condition,
-        )
-        .await?;
-    xml_response(CopyObjectResult {
-        etag: quoted(&object.etag),
-        last_modified: format_time(object.modified_at),
-    })
-}
-
-async fn complete_multipart(engine: &Engine, upload_id: &str, body: Body) -> Result<Response> {
-    let bytes = to_bytes(body, 2 * 1024 * 1024).await?;
-    let request: CompleteMultipartRequest =
-        from_str(std::str::from_utf8(&bytes).map_err(|_| anyhow!("InvalidRequest"))?)
-            .map_err(|_| anyhow!("InvalidRequest"))?;
-    let requested = request
-        .parts
-        .into_iter()
-        .map(|part| (part.part_number, normalize_etag(&part.etag)))
-        .collect::<Vec<_>>();
-    let object = engine.complete_multipart(upload_id, &requested).await?;
-    let location = format!("/{}/{}", object.bucket, object.key);
-    xml_response(CompleteMultipartResult {
-        bucket: object.bucket,
-        key: object.key,
-        etag: quoted(&object.etag),
-        location,
-    })
-}
-
-async fn list_parts(engine: &Engine, upload_id: String) -> Result<Response> {
-    let parts = engine.list_parts(&upload_id).await?;
-    let upload = engine
-        .db
-        .get_upload(&upload_id)
-        .await?
-        .ok_or_else(|| anyhow!("NoSuchUpload"))?;
-    xml_response(ListPartsResult {
-        bucket: upload.bucket,
-        key: upload.key,
-        upload_id,
-        parts: parts
-            .into_iter()
-            .map(|part| PartXml {
-                part_number: part.part_number,
-                etag: quoted(&part.etag),
-                size: part.size,
-                last_modified: format_time(upload.created_at),
-            })
-            .collect(),
-    })
-}
-
-async fn list_multipart_uploads(engine: &Engine, bucket: &str) -> Result<Response> {
-    if !engine.db.bucket_exists(bucket).await? {
-        bail!("NoSuchBucket");
-    }
-    let uploads = engine
-        .list_uploads(bucket, None)
-        .await?
-        .into_iter()
-        .filter(|upload| upload.kind == "multipart")
-        .collect::<Vec<_>>();
-    xml_response(ListMultipartUploadsResult {
-        bucket: bucket.to_string(),
-        uploads: uploads
-            .into_iter()
-            .map(|upload| UploadXml {
-                key: upload.key,
-                upload_id: upload.upload_id,
-                initiated: format_time(upload.created_at),
-            })
-            .collect(),
-    })
-}
-
-async fn multi_delete(engine: &Engine, bucket: &str, body: Body) -> Result<Response> {
-    if !engine.db.bucket_exists(bucket).await? {
-        bail!("NoSuchBucket");
-    }
-    let bytes = to_bytes(body, 4 * 1024 * 1024).await?;
-    let request: DeleteRequest =
-        from_str(std::str::from_utf8(&bytes).map_err(|_| anyhow!("MalformedXML"))?)
-            .map_err(|_| anyhow!("MalformedXML"))?;
-    let DeleteRequest { objects, quiet } = request;
-    if objects.is_empty() || objects.len() > 1000 {
-        bail!("InvalidRequest");
-    }
-    let mut deleted = Vec::new();
-    let condition = ObjectCondition::default();
-    for object in objects {
-        let key = object.key;
-        let _ = engine.delete_object(bucket, &key, &condition).await?;
-        deleted.push(DeletedXml { key });
-    }
-    xml_response(DeleteResult {
-        deleted: (!quiet).then_some(deleted),
-    })
-}
-
 fn parse_copy_source(source: &str) -> Result<(String, String)> {
     let source = source.trim_start_matches('/');
     let mut parts = source.splitn(2, '/');
-    let bucket = percent_encoding::percent_decode_str(parts.next().unwrap_or_default())
-        .decode_utf8()
-        .map_err(|_| anyhow!("InvalidRequest"))?
-        .to_string();
-    let key = percent_encoding::percent_decode_str(parts.next().unwrap_or_default())
-        .decode_utf8()
-        .map_err(|_| anyhow!("InvalidRequest"))?
-        .to_string();
+    let bucket = decode_path(parts.next().unwrap_or_default())?;
+    let key = decode_path(parts.next().unwrap_or_default())?;
     if bucket.is_empty() || key.is_empty() {
         bail!("InvalidRequest");
     }
@@ -1119,161 +810,6 @@ fn insert_dynamic_header(headers: &mut HeaderMap, name: &str, value: &str) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_full_suffix_and_open_ranges() -> Result<()> {
-        assert_eq!(parse_range(None, 10)?, (0, 9, false));
-        assert_eq!(parse_range(Some("bytes=2-5"), 10)?, (2, 5, true));
-        assert_eq!(parse_range(Some("bytes=7-"), 10)?, (7, 9, true));
-        assert_eq!(parse_range(Some("bytes=-3"), 10)?, (7, 9, true));
-        assert!(parse_range(Some("bytes=10-"), 10).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn etag_conditions_take_precedence_over_date_conditions() -> Result<()> {
-        let object = ObjectRecord {
-            id: 1,
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            size: 0,
-            etag: "current".to_string(),
-            metadata: ObjectMetadata::default(),
-            created_at: 100,
-            modified_at: 100,
-            blocks: Vec::new(),
-        };
-        let mut headers = HeaderMap::new();
-        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"old\""));
-        headers.insert(
-            header::IF_MODIFIED_SINCE,
-            HeaderValue::from_str(&httpdate::fmt_http_date(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(200),
-            ))?,
-        );
-        check_conditions(&object, &headers)?;
-
-        let mut headers = HeaderMap::new();
-        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"current\""));
-        headers.insert(
-            header::IF_UNMODIFIED_SINCE,
-            HeaderValue::from_str(&httpdate::fmt_http_date(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(50),
-            ))?,
-        );
-        check_conditions(&object, &headers)?;
-        Ok(())
-    }
-
-    #[test]
-    fn parses_path_style_and_validates_bucket_names() -> Result<()> {
-        let uri: Uri = "/my-bucket/folder%2Ffile.txt".parse()?;
-        let target = Target::parse(&uri, &HeaderMap::new(), None)?;
-        assert_eq!(target.bucket.as_deref(), Some("my-bucket"));
-        assert_eq!(target.key.as_deref(), Some("folder/file.txt"));
-        assert!(validate_bucket("my-bucket").is_ok());
-        assert!(validate_bucket("bad_bucket").is_err());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn serializes_standard_s3_error_root() -> Result<()> {
-        let uri: Uri = "/A".parse()?;
-        let response = error_response(
-            StatusCode::FORBIDDEN,
-            "SignatureDoesNotMatch".to_string(),
-            "signature mismatch",
-            &uri,
-            "request-1",
-        );
-        let body = to_bytes(response.into_body(), 1024 * 1024).await?;
-        let body = std::str::from_utf8(&body)?;
-        assert!(body.contains("<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"));
-        assert!(!body.contains("<ErrorXml"));
-        Ok(())
-    }
-
-    #[test]
-    fn serializes_s3_multipart_and_location_roots() -> Result<()> {
-        let initiate = to_string(&InitiateMultipartUpload {
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            upload_id: "upload".to_string(),
-        })?;
-        assert!(initiate.starts_with("<InitiateMultipartUploadResult>"));
-
-        let complete = to_string(&CompleteMultipartResult {
-            location: "/bucket/key".to_string(),
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            etag: "etag".to_string(),
-        })?;
-        assert!(complete.starts_with("<CompleteMultipartUploadResult>"));
-
-        let location = to_string(&BucketLocation {
-            location: "us-east-1".to_string(),
-        })?;
-        assert_eq!(
-            location,
-            "<LocationConstraint>us-east-1</LocationConstraint>"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn maps_s3_error_codes_to_http_statuses() {
-        assert_eq!(
-            status_for(&anyhow!("InvalidRequest")),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(status_for(&anyhow!("BucketNotEmpty")), StatusCode::CONFLICT);
-        assert_eq!(
-            status_for(&anyhow!("MethodNotAllowed")),
-            StatusCode::METHOD_NOT_ALLOWED
-        );
-        assert_eq!(
-            status_for(&anyhow!("NotImplemented")),
-            StatusCode::NOT_IMPLEMENTED
-        );
-        assert_eq!(
-            public_error_message("InternalError", &anyhow!("database path: /secret")),
-            "Internal server error"
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_utf8_paths_as_client_errors() -> Result<()> {
-        let uri: Uri = "/bucket/%FF".parse()?;
-        let error = Target::parse(&uri, &HeaderMap::new(), None)
-            .err()
-            .ok_or_else(|| anyhow!("expected invalid path error"))?;
-        assert_eq!(status_for(&error), StatusCode::BAD_REQUEST);
-        let error = parse_copy_source("/bucket/%FF")
-            .err()
-            .ok_or_else(|| anyhow!("expected invalid copy source error"))?;
-        assert_eq!(status_for(&error), StatusCode::BAD_REQUEST);
-        Ok(())
-    }
-}
-
-fn xml_response<T: Serialize>(value: T) -> Result<Response> {
-    let xml = to_string(&value).map_err(|error| anyhow!("XML serialization: {error}"))?;
-    let body = Body::from(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>{}",
-        with_namespace(&xml)
-    ));
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/xml"),
-    );
-    Ok(response)
-}
-
 fn empty_response(status: StatusCode) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = status;
@@ -1414,343 +950,6 @@ fn request_content_length(headers: &HeaderMap) -> Result<Option<i64>> {
         bail!("InvalidRequest");
     }
     Ok(Some(value))
-}
-
-fn with_namespace(xml: &str) -> String {
-    if let Some(index) = xml.find('>') {
-        format!("{} xmlns=\"{}\"{}", &xml[..index], XMLNS, &xml[index..])
-    } else {
-        xml.to_string()
-    }
-}
-
-struct Target {
-    bucket: Option<String>,
-    key: Option<String>,
-}
-
-impl Target {
-    fn parse(uri: &Uri, headers: &HeaderMap, public_host: Option<&str>) -> Result<Self> {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        let path = uri.path().trim_start_matches('/');
-        if let Some(public_host) = public_host {
-            let public_host = public_host.trim_end_matches('/');
-            if host != public_host {
-                let bucket = host
-                    .strip_suffix(public_host)
-                    .and_then(|prefix| prefix.strip_suffix('.'))
-                    .unwrap_or_default();
-                if !bucket.is_empty() {
-                    return Ok(Self {
-                        bucket: Some(bucket.to_string()),
-                        key: if path.is_empty() {
-                            None
-                        } else {
-                            Some(decode_path(path)?)
-                        },
-                    });
-                }
-            }
-        }
-        if path.is_empty() {
-            return Ok(Self {
-                bucket: None,
-                key: None,
-            });
-        }
-        let (bucket, key) = match path.split_once('/') {
-            Some((bucket, key)) => (bucket, Some(key)),
-            None => (path, None),
-        };
-        Ok(Self {
-            bucket: Some(decode_path(bucket)?),
-            key: key.map(decode_path).transpose()?,
-        })
-    }
-}
-
-fn decode_path(path: &str) -> Result<String> {
-    Ok(percent_encoding::percent_decode_str(path)
-        .decode_utf8()
-        .map_err(|_| anyhow!("InvalidRequest"))?
-        .to_string())
-}
-
-#[derive(Serialize)]
-#[serde(rename = "ListAllMyBucketsResult")]
-struct ListAllMyBuckets {
-    buckets: Buckets,
-}
-#[derive(Serialize)]
-struct Buckets {
-    #[serde(rename = "Bucket", default)]
-    bucket: Vec<BucketXml>,
-}
-#[derive(Serialize)]
-struct BucketXml {
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "CreationDate")]
-    creation_date: String,
-}
-#[derive(Serialize)]
-struct ListBucketResult {
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "Prefix")]
-    prefix: String,
-    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
-    delimiter: Option<String>,
-    #[serde(rename = "MaxKeys")]
-    max_keys: i32,
-    #[serde(rename = "KeyCount")]
-    key_count: i32,
-    #[serde(rename = "IsTruncated")]
-    is_truncated: bool,
-    #[serde(rename = "Marker", skip_serializing_if = "Option::is_none")]
-    marker: Option<String>,
-    #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
-    start_after: Option<String>,
-    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
-    continuation_token: Option<String>,
-    #[serde(rename = "NextMarker", skip_serializing_if = "Option::is_none")]
-    next_marker: Option<String>,
-    #[serde(
-        rename = "NextContinuationToken",
-        skip_serializing_if = "Option::is_none"
-    )]
-    next_continuation_token: Option<String>,
-    #[serde(rename = "Contents", default)]
-    contents: Vec<ObjectXml>,
-    #[serde(rename = "CommonPrefixes", default)]
-    common_prefixes: Vec<CommonPrefix>,
-}
-#[derive(Serialize)]
-struct ObjectXml {
-    #[serde(rename = "Key")]
-    key: String,
-    #[serde(rename = "LastModified")]
-    last_modified: String,
-    #[serde(rename = "ETag")]
-    etag: String,
-    #[serde(rename = "Size")]
-    size: i64,
-    #[serde(rename = "StorageClass")]
-    storage_class: String,
-}
-#[derive(Serialize)]
-struct CommonPrefix {
-    #[serde(rename = "Prefix")]
-    prefix: String,
-}
-#[derive(Serialize)]
-#[serde(rename = "LocationConstraint")]
-struct BucketLocation {
-    #[serde(rename = "$text")]
-    location: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename = "CORSConfiguration")]
-struct CorsConfigurationXml {
-    #[serde(rename = "CORSRule", default)]
-    rules: Vec<CorsRuleXml>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct CorsRuleXml {
-    #[serde(rename = "AllowedOrigin", default)]
-    allowed_origins: Vec<String>,
-    #[serde(rename = "AllowedMethod", default)]
-    allowed_methods: Vec<String>,
-    #[serde(rename = "AllowedHeader", default)]
-    allowed_headers: Vec<String>,
-    #[serde(rename = "ExposeHeader", default)]
-    expose_headers: Vec<String>,
-    #[serde(rename = "MaxAgeSeconds", default)]
-    max_age_seconds: Option<u64>,
-}
-
-impl CorsConfigurationXml {
-    fn from(configuration: &CorsConfiguration) -> Self {
-        Self {
-            rules: vec![CorsRuleXml {
-                allowed_origins: configuration.allowed_origins.clone(),
-                allowed_methods: configuration.allowed_methods.clone(),
-                allowed_headers: configuration.allowed_headers.clone(),
-                expose_headers: configuration.expose_headers.clone(),
-                max_age_seconds: Some(configuration.max_age_seconds),
-            }],
-        }
-    }
-
-    fn into_configuration(self) -> Result<CorsConfiguration> {
-        if self.rules.is_empty() {
-            bail!("InvalidRequest");
-        }
-        let mut configuration = CorsConfiguration {
-            allowed_origins: Vec::new(),
-            allowed_methods: Vec::new(),
-            allowed_headers: Vec::new(),
-            expose_headers: Vec::new(),
-            max_age_seconds: 3600,
-        };
-        for rule in self.rules {
-            configuration.allowed_origins.extend(rule.allowed_origins);
-            configuration.allowed_methods.extend(
-                rule.allowed_methods
-                    .into_iter()
-                    .map(|method| method.to_ascii_uppercase()),
-            );
-            configuration.allowed_headers.extend(rule.allowed_headers);
-            configuration.expose_headers.extend(rule.expose_headers);
-            if let Some(max_age) = rule.max_age_seconds {
-                configuration.max_age_seconds = max_age;
-            }
-        }
-        for values in [
-            &mut configuration.allowed_origins,
-            &mut configuration.allowed_methods,
-            &mut configuration.allowed_headers,
-            &mut configuration.expose_headers,
-        ] {
-            values.sort_unstable();
-            values.dedup();
-        }
-        if configuration.allowed_origins.is_empty()
-            || configuration.allowed_methods.is_empty()
-            || configuration.allowed_headers.is_empty()
-        {
-            bail!("InvalidRequest");
-        }
-        if configuration
-            .allowed_origins
-            .iter()
-            .any(|origin| origin == "*")
-            && configuration.allowed_origins.len() > 1
-        {
-            bail!("InvalidRequest");
-        }
-        Ok(configuration)
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename = "InitiateMultipartUploadResult")]
-struct InitiateMultipartUpload {
-    #[serde(rename = "Bucket")]
-    bucket: String,
-    #[serde(rename = "Key")]
-    key: String,
-    #[serde(rename = "UploadId")]
-    upload_id: String,
-}
-#[derive(Serialize)]
-#[serde(rename = "CompleteMultipartUploadResult")]
-struct CompleteMultipartResult {
-    #[serde(rename = "Location")]
-    location: String,
-    #[serde(rename = "Bucket")]
-    bucket: String,
-    #[serde(rename = "Key")]
-    key: String,
-    #[serde(rename = "ETag")]
-    etag: String,
-}
-#[derive(Serialize)]
-struct CopyObjectResult {
-    #[serde(rename = "ETag")]
-    etag: String,
-    #[serde(rename = "LastModified")]
-    last_modified: String,
-}
-#[derive(Serialize)]
-struct ListPartsResult {
-    #[serde(rename = "Bucket")]
-    bucket: String,
-    #[serde(rename = "Key")]
-    key: String,
-    #[serde(rename = "UploadId")]
-    upload_id: String,
-    #[serde(rename = "Part", default)]
-    parts: Vec<PartXml>,
-}
-#[derive(Serialize)]
-struct PartXml {
-    #[serde(rename = "PartNumber")]
-    part_number: i32,
-    #[serde(rename = "LastModified")]
-    last_modified: String,
-    #[serde(rename = "ETag")]
-    etag: String,
-    #[serde(rename = "Size")]
-    size: i64,
-}
-#[derive(Serialize)]
-struct ListMultipartUploadsResult {
-    #[serde(rename = "Bucket")]
-    bucket: String,
-    #[serde(rename = "Upload", default)]
-    uploads: Vec<UploadXml>,
-}
-#[derive(Serialize)]
-struct UploadXml {
-    #[serde(rename = "Key")]
-    key: String,
-    #[serde(rename = "UploadId")]
-    upload_id: String,
-    #[serde(rename = "Initiated")]
-    initiated: String,
-}
-#[derive(Serialize)]
-struct DeleteResult {
-    #[serde(rename = "Deleted", skip_serializing_if = "Option::is_none")]
-    deleted: Option<Vec<DeletedXml>>,
-}
-#[derive(Serialize)]
-struct DeletedXml {
-    #[serde(rename = "Key")]
-    key: String,
-}
-#[derive(Serialize)]
-#[serde(rename = "Error")]
-struct ErrorXml {
-    #[serde(rename = "Code")]
-    code: String,
-    #[serde(rename = "Message")]
-    message: String,
-    #[serde(rename = "Resource")]
-    resource: String,
-    #[serde(rename = "RequestId")]
-    request_id: String,
-}
-
-#[derive(Deserialize)]
-struct CompleteMultipartRequest {
-    #[serde(rename = "Part", default)]
-    parts: Vec<CompletedPart>,
-}
-#[derive(Deserialize)]
-struct CompletedPart {
-    #[serde(rename = "PartNumber")]
-    part_number: i32,
-    #[serde(rename = "ETag")]
-    etag: String,
-}
-#[derive(Deserialize)]
-struct DeleteRequest {
-    #[serde(rename = "Object", default)]
-    objects: Vec<DeleteObject>,
-    #[serde(rename = "Quiet", default)]
-    quiet: bool,
-}
-#[derive(Deserialize)]
-struct DeleteObject {
-    #[serde(rename = "Key")]
-    key: String,
 }
 
 trait IntoResponseExt {

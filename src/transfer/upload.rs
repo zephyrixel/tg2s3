@@ -620,6 +620,9 @@ fn join_task(
 }
 
 fn block_size(chunk_size: usize, offset: i64, total: i64) -> Result<u64> {
+    if chunk_size == 0 {
+        bail!("chunk size must be greater than zero");
+    }
     let remaining = total
         .checked_sub(offset)
         .ok_or_else(|| anyhow!("object storage layout is invalid"))?;
@@ -627,4 +630,19 @@ fn block_size(chunk_size: usize, offset: i64, total: i64) -> Result<u64> {
         bail!("object storage layout is invalid");
     }
     Ok(remaining.min(chunk_size as i64) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calculates_non_empty_block_sizes() -> Result<()> {
+        assert_eq!(block_size(8, 0, 20)?, 8);
+        assert_eq!(block_size(8, 8, 20)?, 8);
+        assert_eq!(block_size(8, 16, 20)?, 4);
+        assert!(block_size(0, 0, 20).is_err());
+        assert!(block_size(8, 20, 20).is_err());
+        Ok(())
+    }
 }

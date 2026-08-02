@@ -16,8 +16,20 @@ pub(crate) async fn cleanup_uploaded(
     chat_id: i64,
     uploaded: Vec<UploadedBlock>,
 ) {
-    for block in uploaded {
-        cleanup_untracked_block(db, telegram, to_reference(chat_id, &block)).await;
+    let references = uploaded
+        .iter()
+        .map(|block| to_reference(chat_id, block))
+        .collect();
+    cleanup_block_refs(db, telegram, references).await;
+}
+
+pub(crate) async fn cleanup_block_refs(
+    db: &Db,
+    telegram: &TelegramClient,
+    references: Vec<BlockRef>,
+) {
+    for reference in references {
+        cleanup_untracked_block(db, telegram, reference).await;
     }
 }
 
